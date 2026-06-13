@@ -85,6 +85,26 @@ export interface TabularEnvironment extends SyncEnvironment {
   currentState(): number;
 }
 
+// Continuous-observation environment for deep-RL (function approximation).
+// Returns the RAW observation vector (number[]) instead of a discretized index, so a
+// neural network can consume the continuous state directly. Reuses the same synchronous
+// fast path; deep agents train on number[] observations.
+export interface VecEnvironment extends SyncEnvironment {
+  readonly actionSpace: DiscreteSpace | BoxSpace; // discrete for DQN / discrete PPO; box for continuous action (Pendulum)
+  readonly observationSpace: BoxSpace;
+  maxSteps: number;
+  resetSync(seed?: number): number[];
+  stepSync(action: Action): StepResult; // observation is number[]
+}
+
+export function isVecEnv(e: Environment): e is VecEnvironment {
+  return isSyncEnv(e) && e.observationSpace.kind === 'box';
+}
+
+// Any interactive (synchronous) environment the store can drive: tabular (discrete index) or
+// vector (continuous observation). Both expose maxSteps + resetSync/stepSync.
+export type AnyEnv = TabularEnvironment | VecEnvironment;
+
 export interface TransitionOutcome {
   prob: number;
   nextState: number;

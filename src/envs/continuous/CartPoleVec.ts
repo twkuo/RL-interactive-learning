@@ -1,17 +1,18 @@
-// CartPole-v1 (continuous state, discrete actions) — tabular variant.
-// Runs continuous physics internally; returns the DISCRETIZED state index to the agent,
-// and provides the continuous state to the renderer. Physics is shared with CartPoleVec
-// via ./physics/cartpole.
+// CartPole-v1 (continuous state, discrete actions) — continuous/vector variant for deep RL.
+// Returns the RAW [x, ẋ, θ, θ̇] observation so a neural network consumes it directly
+// (no discretization). Physics is shared with the tabular CartPole via ./physics/cartpole,
+// so trajectories match exactly for the same seed + actions.
 import type {
+  BoxSpace,
   DiscreteSpace,
   ObsField,
   RewardParam,
   StepResult,
-  TabularEnvironment,
+  VecEnvironment,
 } from '../../core/types';
-import { discrete } from '../../core/spaces';
+import { box, discrete } from '../../core/spaces';
 import { RNG } from '../../core/rng';
-import { Discretizer } from '../discretize';
+import type { CartPoleRenderState } from './CartPole';
 import {
   CARTPOLE_MAX_STEPS,
   THETA_THRESHOLD,
@@ -22,60 +23,37 @@ import {
   type CartPoleState,
 } from './physics/cartpole';
 
-export interface CartPoleRenderState {
-  x: number;
-  xDot: number;
-  theta: number;
-  thetaDot: number;
-  xThreshold: number;
-  thetaThreshold: number;
-}
-
-export class CartPole implements TabularEnvironment {
-  readonly id = 'cartpole';
+export class CartPoleVec implements VecEnvironment {
+  readonly id = 'cartpole-vec';
   readonly name = 'CartPole';
   readonly renderKind = 'cartpole';
   readonly actionSpace: DiscreteSpace = discrete(2);
-  readonly observationSpace: DiscreteSpace;
+  // Observation bounds used to normalize NN inputs (velocity bounds are nominal, not hard limits).
+  readonly observationSpace: BoxSpace = box(
+    [-X_THRESHOLD, -3, -THETA_THRESHOLD, -3.5],
+    [X_THRESHOLD, 3, THETA_THRESHOLD, 3.5],
+  );
   maxSteps = CARTPOLE_MAX_STEPS;
 
-  private disc: Discretizer;
   private rng: RNG;
-  private cont: CartPoleState = [0, 0, 0, 0]; // x, xDot, theta, thetaDot
+  private cont: CartPoleState = [0, 0, 0, 0];
   private steps = 0;
-  private cur = 0;
   private stepReward = 1;
   private failPenalty = 0;
 
   constructor(seed = 12345) {
-    this.disc = new Discretizer([
-      { low: -X_THRESHOLD, high: X_THRESHOLD, bins: 3 },
-      { low: -3, high: 3, bins: 3 },
-      { low: -THETA_THRESHOLD, high: THETA_THRESHOLD, bins: 6 },
-      { low: -3.5, high: 3.5, bins: 6 },
-    ]);
-    this.observationSpace = discrete(this.disc.stateCount);
     this.rng = new RNG(seed);
-  }
-
-  stateCount(): number {
-    return this.disc.stateCount;
-  }
-
-  currentState(): number {
-    return this.cur;
   }
 
   actionMeanings(): string[] {
     return ['Push left', 'Push right'];
   }
 
-  resetSync(seed?: number): number {
+  resetSync(seed?: number): number[] {
     if (seed !== undefined) this.rng.setSeed(seed);
     this.cont = cartpoleReset(this.rng);
     this.steps = 0;
-    this.cur = this.disc.index(this.cont);
-    return this.cur;
+    return [...this.cont];
   }
 
   stepSync(action: number): StepResult {
@@ -83,12 +61,11 @@ export class CartPole implements TabularEnvironment {
     this.steps += 1;
     const terminated = cartpoleTerminated(this.cont);
     const truncated = !terminated && this.steps >= this.maxSteps;
-    this.cur = this.disc.index(this.cont);
     const reward = this.stepReward + (terminated ? this.failPenalty : 0);
-    return { observation: this.cur, reward, terminated, truncated };
+    return { observation: [...this.cont], reward, terminated, truncated };
   }
 
-  async reset(seed?: number): Promise<number> {
+  async reset(seed?: number): Promise<number[]> {
     return this.resetSync(seed);
   }
 

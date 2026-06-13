@@ -1,19 +1,31 @@
 // Global state + the "single-step reveal sequence" state machine.
 // Reveal sequence: deciding (show Q → predict → reveal action) → result (execute + update) → advance (move to the next state).
+//
+// Two training paths:
+//  - Tabular algorithms train SYNCHRONOUSLY on the main thread (runEpisodes) — instant for small envs.
+//  - Deep algorithms (DQN, …) train in a Web Worker (TensorFlow.js); progress streams back and the
+//    trained weights are loaded into the main-thread agent so the step-by-step view keeps working.
 import { create } from 'zustand';
 import type {
   ActionExplanation,
   Agent,
+  AnyEnv,
+  Obs,
   StepResult,
   TabularEnvironment,
   UpdateInfo,
 } from '../core/types';
-import { getEnvEntry } from '../envs/registry';
-import { DEFAULT_HYPERPARAMS, getAlgoEntry } from '../algos/registry';
+import { ENV_REGISTRY, getEnvEntry } from '../envs/registry';
+import { DEFAULT_HYPERPARAMS, defaultHyperparams, getAlgoEntry } from '../algos/registry';
+import type { FromWorker, StartMsg, ToWorker } from '../training/protocol';
+import type { WeightDump } from '../core/nn/weights';
 
 const SEED = 42;
+const DEFAULT_BOX_ENV = 'cartpole-vec';
+const DEFAULT_DISCRETE_ENV = 'gridworld';
 
 export type Phase = 'deciding' | 'result';
+export type TrainingStatus = 'idle' | 'running' | 'done';
 
 interface Decision {
   action: number;
@@ -25,6 +37,13 @@ export interface EpisodeReturn {
   return: number;
 }
 
+// Deep agents expose these beyond the base Agent interface (weight transfer + cleanup).
+interface Trainable {
+  loadWeightDump?(w: WeightDump): void;
+  setEpsilon?(e: number): void;
+  dispose?(): void;
+}
+
 interface RLState {
   // ---- settings ----
   envId: string;
@@ -34,11 +53,12 @@ interface RLState {
   speed: number; // ms / auto step
   maxSteps: number; // per-episode step limit (reaching it triggers truncated)
   // ---- runtime objects ----
-  env: TabularEnvironment;
+  env: AnyEnv;
   agent: Agent;
+  agentLoading: boolean; // true while a deep agent's module/model is loading (async)
   // ---- reveal sequence state ----
-  currentState: number;
-  inspectedState: number | null; // the cell the mouse is hovering over (for inspection), null = view the current state
+  currentState: Obs;
+  inspectedState: number | null; // grid cell the mouse hovers (inspection); null = current state
   phase: Phase;
   revealed: boolean;
   explanation: ActionExplanation | null;
@@ -60,6 +80,18 @@ interface RLState {
   runCounter: number;
   isPlaying: boolean;
   tick: number; // triggers a canvas redraw
+  // ---- deep-RL training slice (Web Worker) ----
+  trainingStatus: TrainingStatus;
+  trainingEpisode: number;
+  trainingTotal: number;
+  lossHistory: number[];
+  tdErrorHistory: number[];
+  bufferFill: number; // 0..1 replay buffer fill fraction
+  trainEpsilon: number;
+  trainStepsCount: number;
+  targetSyncEvery: number;
+  bestAvg: number; // best moving-average return found during training (the policy kept for inference)
+  trainingError: string | null;
   // ---- actions ----
   setEnv: (id: string) => void;
   setAlgo: (id: string) => void;
@@ -75,17 +107,20 @@ interface RLState {
   advance: () => void;
   quickStep: () => void;
   train: (episodes: number) => void;
+  startTraining: (episodes: number) => void;
+  cancelTraining: () => void;
   resetAgent: () => void;
   resetEpisode: () => void;
   play: () => void;
   pause: () => void;
   runComparison: () => void;
+  snapshotCurrentRun: () => void;
   setCompareEpisodes: (n: number) => void;
   removeComparisonRun: (id: string) => void;
   clearComparisonRuns: () => void;
 }
 
-function decide(agent: Agent, state: number, carry: Decision | null): Decision {
+function decide(agent: Agent, state: Obs, carry: Decision | null): Decision {
   if (carry) return carry;
   return agent.act(state);
 }
@@ -142,18 +177,192 @@ function runEpisodes(
 // Build the comparison-curve label from the algorithm + its key hyperparameters.
 function autoLabel(algoId: string, hp: Record<string, number>): string {
   const entry = getAlgoEntry(algoId);
+  if (entry.deep) {
+    return `${entry.name} lr${+(hp.lr ?? 0).toFixed(4)} γ${(hp.gamma ?? 0).toFixed(2)}`;
+  }
   let label = `${entry.name} α${hp.alpha.toFixed(2)} γ${hp.gamma.toFixed(2)}`;
   if (entry.usesEpsilon) label += ` ε${hp.epsilon.toFixed(2)}`;
   return label;
 }
 
+// Pick an env compatible with the algorithm (deep needs continuous/box obs; tabular needs discrete).
+function compatibleEnvId(curEnvId: string, algoId: string): string {
+  const cur = getEnvEntry(curEnvId);
+  const needBox = getAlgoEntry(algoId).requires === 'box-obs';
+  const ok = (e: { obsKind: 'discrete' | 'box' }) => (needBox ? e.obsKind === 'box' : e.obsKind !== 'box');
+  if (ok(cur)) return curEnvId; // already compatible
+  // Prefer a compatible env in the SAME comparison group (e.g. cartpole-vec <-> cartpole), so
+  // switching DQN <-> tabular stays on the same task and keeps the comparison chart intact.
+  const sameGroup = ENV_REGISTRY.find((e) => e.compareGroup === cur.compareGroup && ok(e));
+  if (sameGroup) return sameGroup.id;
+  return needBox ? DEFAULT_BOX_ENV : DEFAULT_DISCRETE_ENV;
+}
+
+// Identity of an algorithm's hyperparameter "shape": switching between algos with the same shape
+// keeps the current values (so tabular-vs-tabular comparison stays controlled); a different shape resets.
+function hpShapeKey(algoId: string): string {
+  const e = getAlgoEntry(algoId);
+  return e.hyperparamSpec ? e.hyperparamSpec.map((s) => s.key).join(',') : 'tabular';
+}
+
+// Fresh interactive state after (re)creating an agent: reset the episode and decide the first action.
+function freshInteractive(agent: Agent, env: AnyEnv): Partial<RLState> {
+  const s0 = env.resetSync(SEED);
+  const d = agent.act(s0);
+  return {
+    currentState: s0,
+    phase: 'deciding',
+    revealed: false,
+    explanation: d.explanation,
+    chosenAction: d.action,
+    carry: null,
+    lastStep: null,
+    lastUpdate: null,
+    lastEpisodeUpdate: null,
+    predictedAction: null,
+    predictionCorrect: null,
+    episode: 0,
+    stepInEpisode: 0,
+    totalSteps: 0,
+    cumulativeReward: 0,
+    episodeReturns: [],
+    isPlaying: false,
+  };
+}
+
+function resetTrainingSlice(): Partial<RLState> {
+  return {
+    trainingStatus: 'idle',
+    trainingEpisode: 0,
+    trainingTotal: 0,
+    lossHistory: [],
+    tdErrorHistory: [],
+    bufferFill: 0,
+    trainEpsilon: 0,
+    trainStepsCount: 0,
+    targetSyncEvery: 0,
+    bestAvg: 0,
+    trainingError: null,
+  };
+}
+
 export const useStore = create<RLState>((set, get) => {
-  // initialization
+  // ---- training Web Worker (created lazily on first deep training) ----
+  let worker: Worker | null = null;
+  // Whether the worker holds a trained agent we can CONTINUE from. Reset whenever the agent is
+  // rebuilt (reset / algo / env / hyperparam change) so the next deep Train starts fresh.
+  let sessionTrained = false;
+  const ensureWorker = (): Worker => {
+    if (worker) return worker;
+    worker = new Worker(new URL('../training/trainer.worker.ts', import.meta.url), {
+      type: 'module',
+    });
+    worker.onmessage = (e: MessageEvent<FromWorker>) => {
+      const msg = e.data;
+      if (msg.type === 'progress') {
+        set((s) => ({
+          trainingEpisode: msg.episode,
+          // Append with a cumulative index so the curve continues smoothly across Train presses.
+          episodeReturns: [...s.episodeReturns, { episode: s.episodeReturns.length + 1, return: msg.ret }],
+          lossHistory: [...s.lossHistory, msg.metrics.loss],
+          tdErrorHistory: [...s.tdErrorHistory, msg.metrics.tdError],
+          bufferFill: msg.metrics.bufferFill,
+          trainEpsilon: msg.metrics.epsilon,
+          trainStepsCount: msg.metrics.trainSteps,
+          targetSyncEvery: msg.metrics.targetSync,
+          tick: s.tick + 1,
+        }));
+      } else if (msg.type === 'done') {
+        sessionTrained = true; // worker now holds a trained agent → the next Train continues it
+        const ag = get().agent as unknown as Trainable;
+        if (ag.loadWeightDump) {
+          ag.loadWeightDump(msg.weights); // BEST weights found during training
+          ag.setEpsilon?.(0); // inference = greedy: watch the best learned policy cleanly
+          // Refresh the interactive decision on the current state so it reflects the trained policy.
+          const d = get().agent.act(get().currentState);
+          set((s) => ({
+            trainingStatus: 'done',
+            trainEpsilon: msg.epsilon,
+            bestAvg: msg.bestAvg,
+            phase: 'deciding',
+            revealed: false,
+            explanation: d.explanation,
+            chosenAction: d.action,
+            tick: s.tick + 1,
+          }));
+        } else {
+          set((s) => ({ trainingStatus: 'done', tick: s.tick + 1 }));
+        }
+      } else if (msg.type === 'error') {
+        set((s) => ({ trainingStatus: 'idle', trainingError: msg.message, tick: s.tick + 1 }));
+      }
+    };
+    return worker;
+  };
+
+  // ---- (re)create the agent for the current env+algo, sync (tabular) or async (deep). ----
+  const buildAgent = (envId: string, algoId: string, env: AnyEnv, hp: Record<string, number>, extra: Partial<RLState>) => {
+    const entry = getAlgoEntry(algoId);
+    (get().agent as unknown as Trainable).dispose?.();
+    sessionTrained = false; // new agent → the next deep Train starts a fresh network
+    const head: Partial<RLState> = {
+      envId,
+      algoId,
+      env,
+      hyperparams: hp,
+      maxSteps: env.maxSteps,
+      ...resetTrainingSlice(),
+      ...extra,
+    };
+    if (entry.deep) {
+      // Lazy import keeps tfjs out of the main bundle. Until it resolves, show a loading state.
+      const s0 = env.resetSync(SEED);
+      set((s) => ({
+        ...head,
+        agentLoading: true,
+        currentState: s0,
+        phase: 'deciding',
+        revealed: false,
+        explanation: null,
+        chosenAction: null,
+        carry: null,
+        lastStep: null,
+        lastUpdate: null,
+        lastEpisodeUpdate: null,
+        predictedAction: null,
+        predictionCorrect: null,
+        episode: 0,
+        stepInEpisode: 0,
+        totalSteps: 0,
+        cumulativeReward: 0,
+        episodeReturns: [],
+        isPlaying: false,
+        tick: s.tick + 1,
+      }));
+      entry.load!().then((mod) => {
+        if (get().algoId !== algoId || get().env !== env) return; // user moved on
+        const a = mod.create(env, hp);
+        const d = a.act(get().currentState);
+        set((s) => ({
+          agent: a,
+          agentLoading: false,
+          explanation: d.explanation,
+          chosenAction: d.action,
+          tick: s.tick + 1,
+        }));
+      });
+    } else {
+      const a = entry.create!(env as TabularEnvironment, hp);
+      set((s) => ({ ...head, agent: a, agentLoading: false, ...freshInteractive(a, env), tick: s.tick + 1 }));
+    }
+  };
+
+  // initialization (tabular default — no tfjs loaded)
   const env = getEnvEntry('gridworld').create(SEED);
   const hp = { ...DEFAULT_HYPERPARAMS };
-  const agent = getAlgoEntry('q-learning').create(env, hp);
-  const s0 = env.resetSync(SEED) as number;
-  const first = agent.act(s0);
+  const agent = getAlgoEntry('q-learning').create!(env as TabularEnvironment, hp);
+  const s0 = env.resetSync(SEED);
+  const firstDecision = agent.act(s0);
 
   return {
     envId: 'gridworld',
@@ -164,12 +373,13 @@ export const useStore = create<RLState>((set, get) => {
     maxSteps: env.maxSteps,
     env,
     agent,
+    agentLoading: false,
     currentState: s0,
     inspectedState: null,
     phase: 'deciding',
     revealed: false,
-    explanation: first.explanation,
-    chosenAction: first.action,
+    explanation: firstDecision.explanation,
+    chosenAction: firstDecision.action,
     carry: null,
     lastStep: null,
     lastUpdate: null,
@@ -186,69 +396,40 @@ export const useStore = create<RLState>((set, get) => {
     runCounter: 0,
     isPlaying: false,
     tick: 0,
+    trainingStatus: 'idle',
+    trainingEpisode: 0,
+    trainingTotal: 0,
+    lossHistory: [],
+    tdErrorHistory: [],
+    bufferFill: 0,
+    trainEpsilon: 0,
+    trainStepsCount: 0,
+    targetSyncEvery: 0,
+    bestAvg: 0,
+    trainingError: null,
 
     setEnv: (id) => {
+      const groupChanged = getEnvEntry(id).compareGroup !== getEnvEntry(get().envId).compareGroup;
       const e = getEnvEntry(id).create(SEED);
-      const a = getAlgoEntry(get().algoId).create(e, get().hyperparams);
-      const st = e.resetSync(SEED) as number;
-      const d = a.act(st);
-      set({
-        envId: id,
-        env: e,
-        agent: a,
-        maxSteps: e.maxSteps, // when switching environments, reset to that environment's default step limit
-        currentState: st,
-        phase: 'deciding',
-        revealed: false,
-        explanation: d.explanation,
-        chosenAction: d.action,
-        carry: null,
-        lastStep: null,
-        lastUpdate: null,
-        predictedAction: null,
-        predictionCorrect: null,
-        episode: 0,
-        stepInEpisode: 0,
-        totalSteps: 0,
-        cumulativeReward: 0,
-        episodeReturns: [],
-        comparisonRuns: [],
-        isPlaying: false,
-        tick: get().tick + 1,
-      });
+      buildAgent(id, get().algoId, e, get().hyperparams, groupChanged ? { comparisonRuns: [] } : {});
     },
 
     setAlgo: (id) => {
-      const e = get().env;
-      const a = getAlgoEntry(id).create(e, get().hyperparams);
-      const st = e.resetSync(SEED) as number;
-      const d = a.act(st);
-      set({
-        algoId: id,
-        agent: a,
-        currentState: st,
-        phase: 'deciding',
-        revealed: false,
-        explanation: d.explanation,
-        chosenAction: d.action,
-        carry: null,
-        lastStep: null,
-        lastUpdate: null,
-        predictedAction: null,
-        predictionCorrect: null,
-        episode: 0,
-        stepInEpisode: 0,
-        totalSteps: 0,
-        cumulativeReward: 0,
-        episodeReturns: [],
-        isPlaying: false,
-        tick: get().tick + 1,
-      });
+      const envId = compatibleEnvId(get().envId, id);
+      const envChanged = envId !== get().envId;
+      // Keep the comparison chart unless the comparison GROUP changes (so DQN <-> tabular on
+      // CartPole keeps its curves; only a real task change like CartPole -> GridWorld resets it).
+      const groupChanged = getEnvEntry(envId).compareGroup !== getEnvEntry(get().envId).compareGroup;
+      const e = envChanged ? getEnvEntry(envId).create(SEED) : get().env;
+      const hyperparams =
+        hpShapeKey(get().algoId) === hpShapeKey(id) ? get().hyperparams : defaultHyperparams(getAlgoEntry(id));
+      buildAgent(envId, id, e, hyperparams, groupChanged ? { comparisonRuns: [] } : {});
     },
 
     setHyperparam: (key, value) => {
       const hyperparams = { ...get().hyperparams, [key]: value };
       get().agent.hyperparams[key] = value;
+      sessionTrained = false; // changed settings take effect on the next (fresh) deep training run
       set({ hyperparams });
     },
 
@@ -262,7 +443,7 @@ export const useStore = create<RLState>((set, get) => {
     },
 
     setRewardParam: (key, value) => {
-      get().env.setRewardParam?.(key, value); // change the environment reward immediately; click "Reset Agent" or "Run a round" to use the new reward
+      get().env.setRewardParam?.(key, value); // change reward immediately; reset agent / retrain to learn under it
       set((s) => ({ tick: s.tick + 1 }));
     },
 
@@ -278,7 +459,7 @@ export const useStore = create<RLState>((set, get) => {
 
     revealAction: () => {
       const st = get();
-      if (st.revealed || st.phase !== 'deciding') return;
+      if (st.revealed || st.phase !== 'deciding' || st.agentLoading) return;
       const predictionCorrect =
         st.predictMode && st.predictedAction !== null && st.chosenAction !== null
           ? st.predictedAction === st.chosenAction
@@ -288,10 +469,10 @@ export const useStore = create<RLState>((set, get) => {
 
     executeStep: () => {
       const st = get();
-      if (st.phase !== 'deciding' || !st.revealed || st.chosenAction === null) return;
+      if (st.phase !== 'deciding' || !st.revealed || st.chosenAction === null || st.agentLoading) return;
       const a = st.chosenAction;
       const step = st.env.stepSync(a);
-      const sN = step.observation as number;
+      const sN = step.observation;
       const finished = step.terminated || step.truncated;
       // Draw the next action first (the on-policy a') and keep it for the next state
       let carry: Decision | null = null;
@@ -309,7 +490,6 @@ export const useStore = create<RLState>((set, get) => {
         truncated: step.truncated,
         nextAction,
       });
-      // On episode end (including truncation), call onEpisodeEnd: step-wise methods decay ε (return undefined), MC/REINFORCE perform learning and return a summary
       const epUpd: UpdateInfo | null = finished ? (st.agent.onEpisodeEnd() ?? null) : null;
       set((s) => ({
         phase: 'result',
@@ -329,15 +509,14 @@ export const useStore = create<RLState>((set, get) => {
       if (st.phase !== 'result' || !st.lastStep) return;
       const finished = st.lastStep.terminated || st.lastStep.truncated;
       if (finished) {
-        // onEpisodeEnd was already called in executeStep; here we only do episode counting and reset
         const ep = st.episode + 1;
         const ret = st.cumulativeReward;
-        const s0 = st.env.resetSync() as number;
-        const d = st.agent.act(s0);
+        const s0n = st.env.resetSync();
+        const d = st.agent.act(s0n);
         set((s) => ({
           episode: ep,
           episodeReturns: [...s.episodeReturns, { episode: ep, return: ret }],
-          currentState: s0,
+          currentState: s0n,
           phase: 'deciding',
           revealed: false,
           explanation: d.explanation,
@@ -352,7 +531,7 @@ export const useStore = create<RLState>((set, get) => {
           tick: s.tick + 1,
         }));
       } else {
-        const sN = st.lastStep.observation as number;
+        const sN = st.lastStep.observation;
         const d = decide(st.agent, sN, st.carry);
         set((s) => ({
           currentState: sN,
@@ -371,6 +550,7 @@ export const useStore = create<RLState>((set, get) => {
     },
 
     quickStep: () => {
+      if (get().agentLoading) return;
       const { phase, revealed } = get();
       if (phase === 'deciding' && !revealed) get().revealAction();
       if (get().phase === 'deciding') get().executeStep();
@@ -378,20 +558,23 @@ export const useStore = create<RLState>((set, get) => {
     },
 
     train: (episodes) => {
+      if (getAlgoEntry(get().algoId).deep) {
+        get().startTraining(episodes);
+        return;
+      }
       const st = get();
-      const { env, agent } = st;
+      const env2 = st.env as TabularEnvironment;
       const startEp = st.episode;
-      const { returns: rets, steps } = runEpisodes(env, agent, episodes);
+      const { returns: rets, steps } = runEpisodes(env2, st.agent, episodes);
       const episodeReturns = [...st.episodeReturns];
       rets.forEach((ret, i) => episodeReturns.push({ episode: startEp + i + 1, return: ret }));
-      // Start a fresh episode to enter interactive observation
-      const s0 = env.resetSync() as number;
-      const d = agent.act(s0);
+      const s0n = env2.resetSync() as number;
+      const d = st.agent.act(s0n);
       set((s) => ({
         episode: startEp + episodes,
         totalSteps: st.totalSteps + steps,
         episodeReturns,
-        currentState: s0,
+        currentState: s0n,
         phase: 'deciding',
         revealed: false,
         explanation: d.explanation,
@@ -407,39 +590,64 @@ export const useStore = create<RLState>((set, get) => {
       }));
     },
 
-    resetAgent: () => {
-      const e = get().env;
-      const a = getAlgoEntry(get().algoId).create(e, get().hyperparams);
-      const st = e.resetSync(SEED) as number;
-      const d = a.act(st);
+    startTraining: (episodes) => {
+      const st = get();
+      if (!getAlgoEntry(st.algoId).deep) return;
+      const w = ensureWorker();
+      // Continue the current network unless this is the first run after a reset / settings change.
+      const fresh = !sessionTrained;
+      const rewardParams = (st.env.rewardParams?.() ?? []).map((p) => ({ key: p.key, value: p.value }));
       set((s) => ({
-        agent: a,
-        currentState: st,
-        phase: 'deciding',
-        revealed: false,
-        explanation: d.explanation,
-        chosenAction: d.action,
-        carry: null,
-        lastStep: null,
-        lastUpdate: null,
-        predictedAction: null,
-        predictionCorrect: null,
-        episode: 0,
-        stepInEpisode: 0,
-        totalSteps: 0,
-        cumulativeReward: 0,
-        episodeReturns: [],
-        isPlaying: false,
+        trainingStatus: 'running',
+        trainingEpisode: 0,
+        trainingTotal: episodes,
+        trainingError: null,
+        // Fresh run clears the curves + ε display; a continuation keeps appending to them.
+        ...(fresh
+          ? {
+              episodeReturns: [],
+              lossHistory: [],
+              tdErrorHistory: [],
+              trainStepsCount: 0,
+              bufferFill: 0,
+              bestAvg: 0,
+              trainEpsilon: st.hyperparams.epsilon ?? 1,
+            }
+          : {}),
         tick: s.tick + 1,
       }));
+      const startMsg: StartMsg = {
+        type: 'start',
+        algoId: st.algoId,
+        envId: st.envId,
+        hyperparams: st.hyperparams,
+        rewardParams,
+        maxSteps: st.maxSteps,
+        episodes,
+        seed: SEED,
+        fresh,
+      };
+      w.postMessage(startMsg);
+    },
+
+    cancelTraining: () => {
+      if (worker) {
+        const cancel: ToWorker = { type: 'cancel' };
+        worker.postMessage(cancel);
+      }
+      set((s) => ({ trainingStatus: 'done', tick: s.tick + 1 }));
+    },
+
+    resetAgent: () => {
+      buildAgent(get().envId, get().algoId, get().env, get().hyperparams, {});
     },
 
     resetEpisode: () => {
       const st = get();
-      const s0 = st.env.resetSync() as number;
-      const d = st.agent.act(s0);
+      const s0n = st.env.resetSync();
+      const d = st.agent.act(s0n);
       set((s) => ({
-        currentState: s0,
+        currentState: s0n,
         phase: 'deciding',
         revealed: false,
         explanation: d.explanation,
@@ -460,16 +668,15 @@ export const useStore = create<RLState>((set, get) => {
 
     runComparison: () => {
       const st = get();
-      // headless: run with a brand-new env+agent, without touching the interactive agent/board
-      const tmpEnv = getEnvEntry(st.envId).create(SEED);
-      const defParams = tmpEnv.rewardParams?.() ?? []; // default rewards (record them before applying)
+      if (getAlgoEntry(st.algoId).deep) return; // deep comparison is added later (async worker path)
+      const tmpEnv = getEnvEntry(st.envId).create(SEED) as TabularEnvironment;
+      const defParams = tmpEnv.rewardParams?.() ?? [];
       const defMax = tmpEnv.maxSteps;
-      tmpEnv.maxSteps = st.maxSteps; // the comparison run also applies the currently configured step limit
+      tmpEnv.maxSteps = st.maxSteps;
       const curParams = st.env.rewardParams?.() ?? [];
-      curParams.forEach((p) => tmpEnv.setRewardParam?.(p.key, p.value)); // keep consistent with the current reward settings
-      const tmpAgent = getAlgoEntry(st.algoId).create(tmpEnv, st.hyperparams);
+      curParams.forEach((p) => tmpEnv.setRewardParam?.(p.key, p.value));
+      const tmpAgent = getAlgoEntry(st.algoId).create!(tmpEnv, st.hyperparams);
       const { returns } = runEpisodes(tmpEnv, tmpAgent, st.compareEpisodes);
-      // Label: algorithm + hyperparameters, plus any reward/step settings that "differ from the defaults" (default values are not shown)
       const defMap = new Map(defParams.map((d) => [d.key, d.value]));
       const diffs = curParams
         .filter((p) => Math.abs(p.value - (defMap.get(p.key) ?? p.value)) > 1e-9)
@@ -495,6 +702,25 @@ export const useStore = create<RLState>((set, get) => {
       set((s) => ({ comparisonRuns: s.comparisonRuns.filter((r) => r.id !== id) })),
 
     clearComparisonRuns: () => set({ comparisonRuns: [] }),
+
+    // Persist the current interactive learning curve as a comparison run WITHOUT re-running it.
+    // Lets you keep an (expensive) DQN run and overlay it against tabular methods on the same task.
+    snapshotCurrentRun: () => {
+      const st = get();
+      const returns = st.episodeReturns.map((e) => e.return);
+      if (returns.length === 0) return;
+      const run: ComparisonRun = {
+        id: 'run-' + st.runCounter,
+        label: autoLabel(st.algoId, st.hyperparams),
+        color: COMPARE_PALETTE[st.runCounter % COMPARE_PALETTE.length],
+        returns,
+      };
+      set((s) => ({
+        comparisonRuns: [...s.comparisonRuns, run],
+        runCounter: s.runCounter + 1,
+        tick: s.tick + 1,
+      }));
+    },
   };
 });
 

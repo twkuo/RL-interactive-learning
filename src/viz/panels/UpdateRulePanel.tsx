@@ -3,6 +3,7 @@ import katex from 'katex';
 import { useStore } from '../../state/store';
 import { EPISODIC_FORMULAS, getAlgoEntry, type FormulaKind } from '../../algos/registry';
 import type { UpdateInfo } from '../../core/types';
+import { DqnDashboard } from './DqnDashboard';
 
 const f = (x: number | undefined) => (x === undefined || !Number.isFinite(x) ? '0.000' : x.toFixed(3));
 const RED = '#e06c75';
@@ -26,6 +27,8 @@ function symbolicOf(formula: FormulaKind): string {
       return String.raw`Q(s,a) \leftarrow Q(s,a) + \alpha\,[\,G_t - Q(s,a)\,]\quad(\text{first-visit})`;
     case 'reinforce':
       return String.raw`\theta(s,a) \leftarrow \theta(s,a) + \alpha\,\gamma^t\,G_t\,(\mathbf{1}[a=a_t] - \pi(a\mid s))`;
+    case 'dqn':
+      return String.raw`\mathcal{L}(\theta) = \text{Huber}\!\big(y - Q_\theta(s,a)\big),\ \ y = r + \gamma\,Q_{\theta^-}\!\big(s',\,\arg\max_{a'}Q_\theta(s',a')\big)`;
   }
 }
 
@@ -68,8 +71,12 @@ export function UpdateRulePanel() {
   const phase = useStore((s) => s.phase);
   const lastStep = useStore((s) => s.lastStep);
   const stepInEpisode = useStore((s) => s.stepInEpisode);
-  const formula = getAlgoEntry(algoId).formula;
+  const entry = getAlgoEntry(algoId);
+  const formula = entry.formula;
   const episodic = EPISODIC_FORMULAS.includes(formula);
+
+  // Deep RL has no hand-derivable per-step update — show the training dashboard instead.
+  if (entry.deep) return <DqnDashboard />;
 
   const justEnded =
     phase === 'result' && !!lastStep && (lastStep.terminated || lastStep.truncated) && !!lastEpisodeUpdate;

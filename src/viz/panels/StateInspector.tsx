@@ -1,12 +1,14 @@
 // State inspector: hover a cell to see any state's V, each action's reward r(s,a), and Q(s,a) or π(a|s).
 import { useStore } from '../../state/store';
 import { isModeledEnv } from '../../core/types';
+import type { TabularEnvironment } from '../../core/types';
 import { argmax } from '../../core/utils';
 
 export function StateInspector() {
-  const env = useStore((s) => s.env);
+  // StateInspector returns null unless the env has a grid, so the tabular cast is safe.
+  const env = useStore((s) => s.env) as TabularEnvironment;
   const agent = useStore((s) => s.agent);
-  const currentState = useStore((s) => s.currentState);
+  const currentState = useStore((s) => s.currentState) as number;
   const inspectedState = useStore((s) => s.inspectedState);
   useStore((s) => s.tick); // trigger re-render
 

@@ -4,14 +4,16 @@ import { useStore } from '../../state/store';
 import { valueColor, normalize } from '../../canvas/colormap';
 import { drawArrow, strokeRect, outlinedText } from '../../canvas/draw';
 import { argmax } from '../../core/utils';
+import type { TabularEnvironment } from '../../core/types';
 
 const CELL = 96;
 
 export function GridRenderer() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const env = useStore((s) => s.env);
+  // GridRenderer only mounts for grid (tabular) environments, so the cast is safe.
+  const env = useStore((s) => s.env) as TabularEnvironment;
   const agent = useStore((s) => s.agent);
-  const currentState = useStore((s) => s.currentState);
+  const currentState = useStore((s) => s.currentState) as number;
   const inspectedState = useStore((s) => s.inspectedState);
   const setInspectedState = useStore((s) => s.setInspectedState);
   const tick = useStore((s) => s.tick);
