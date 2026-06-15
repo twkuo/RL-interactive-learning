@@ -14,7 +14,8 @@ export type FormulaKind =
   | 'double-q'
   | 'mc'
   | 'reinforce'
-  | 'dqn';
+  | 'dqn'
+  | 'ppo';
 
 // Algorithms that update only at episode end (the formula panel needs special handling).
 export const EPISODIC_FORMULAS: FormulaKind[] = ['mc', 'reinforce'];
@@ -65,6 +66,38 @@ const DQN_HP: HyperparamSpec[] = [
   { key: 'batchSize', label: 'Batch size', min: 16, max: 256, step: 16, default: 64, decimals: 0 },
   { key: 'bufferSize', label: 'Replay buffer', min: 1000, max: 50000, step: 1000, default: 10000, decimals: 0 },
   { key: 'targetSync', label: 'Target sync (steps)', min: 100, max: 2000, step: 100, default: 500, decimals: 0 },
+  {
+    key: 'normalize',
+    label: 'Input normalization',
+    min: 0,
+    max: 1,
+    step: 1,
+    default: 1,
+    kind: 'toggle',
+    hint: 'Off → the network sees raw, imbalanced observation scales and learns much worse.',
+  },
+  {
+    key: 'keepBest',
+    label: 'Keep best policy for inference',
+    min: 0,
+    max: 1,
+    step: 1,
+    default: 1,
+    kind: 'toggle',
+    hint: 'Off → inference uses the FINAL weights, which can collapse if you over-train.',
+  },
+];
+
+// PPO's knobs (actor-critic policy gradient: clip range, GAE λ, entropy bonus, rollout/epochs).
+const PPO_HP: HyperparamSpec[] = [
+  { key: 'lr', label: 'Learning rate', min: 0.0001, max: 0.01, step: 0.0001, default: 0.0003, decimals: 4 },
+  { key: 'gamma', label: 'Discount γ', min: 0.8, max: 1, step: 0.01, default: 0.99, decimals: 2 },
+  { key: 'gaeLambda', label: 'GAE λ', min: 0.8, max: 1, step: 0.01, default: 0.95, decimals: 2 },
+  { key: 'clip', label: 'Clip ε', min: 0.05, max: 0.5, step: 0.05, default: 0.2, decimals: 2 },
+  { key: 'entropyCoef', label: 'Entropy coef', min: 0, max: 0.05, step: 0.005, default: 0.01, decimals: 3 },
+  { key: 'epochs', label: 'Epochs / update', min: 1, max: 15, step: 1, default: 6, decimals: 0 },
+  { key: 'rolloutLen', label: 'Rollout length (steps)', min: 256, max: 4096, step: 256, default: 1024, decimals: 0 },
+  { key: 'hiddenUnits', label: 'Hidden units', min: 16, max: 256, step: 16, default: 64, decimals: 0 },
   {
     key: 'normalize',
     label: 'Input normalization',
@@ -161,6 +194,16 @@ export const ALGO_REGISTRY: AlgoEntry[] = [
     requires: 'box-obs',
     hyperparamSpec: DQN_HP,
     load: () => import('./deep/DQN'),
+  },
+  {
+    id: 'ppo',
+    name: 'PPO',
+    usesEpsilon: false,
+    formula: 'ppo',
+    deep: true,
+    requires: 'box-obs',
+    hyperparamSpec: PPO_HP,
+    load: () => import('./deep/PPO'),
   },
 ];
 

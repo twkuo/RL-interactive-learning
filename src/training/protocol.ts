@@ -31,7 +31,7 @@ export interface ProgressMsg {
 export interface DoneMsg {
   type: 'done';
   returns: number[];
-  weights: WeightDump; // BEST weights found during training (not necessarily the final ones)
+  weights: WeightDump[]; // BEST weights per network (DQN = [online]; PPO = [actor, critic])
   epsilon: number;
   bestAvg: number; // best moving-average return achieved (what the returned weights scored)
 }

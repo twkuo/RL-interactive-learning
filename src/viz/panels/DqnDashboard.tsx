@@ -9,17 +9,19 @@ export function DqnDashboard() {
   const status = useStore((s) => s.trainingStatus);
   const ep = useStore((s) => s.trainingEpisode);
   const total = useStore((s) => s.trainingTotal);
-  const loss = useStore((s) => s.lossHistory);
-  const td = useStore((s) => s.tdErrorHistory);
-  const fill = useStore((s) => s.bufferFill);
-  const eps = useStore((s) => s.trainEpsilon);
-  const steps = useStore((s) => s.trainStepsCount);
-  const targetSync = useStore((s) => s.targetSyncEvery);
-  const err = useStore((s) => s.trainingError);
+  const history = useStore((s) => s.metricHistory);
+  const latest = useStore((s) => s.metricLatest);
   const bestAvg = useStore((s) => s.bestAvg);
+  const err = useStore((s) => s.trainingError);
   const agentLoading = useStore((s) => s.agentLoading);
   useStore((s) => s.tick);
 
+  const loss = history.loss ?? [];
+  const td = history.tdError ?? [];
+  const fill = latest.bufferFill ?? 0;
+  const eps = latest.epsilon ?? 0;
+  const steps = latest.trainSteps ?? 0;
+  const targetSync = latest.targetSync ?? 0;
   const lastLoss = loss.length ? loss[loss.length - 1] : null;
   const lastTd = td.length ? td[td.length - 1] : null;
   const stepsToSync = targetSync ? targetSync - (steps % targetSync) : 0;

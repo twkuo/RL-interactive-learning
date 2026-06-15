@@ -235,12 +235,12 @@ export class DQN implements Agent {
   }
 
   // ---- weight transfer (worker → main thread) ----
-  dumpWeights(): WeightDump {
-    return dumpWeights(this.online);
+  dumpWeights(): WeightDump[] {
+    return [dumpWeights(this.online)];
   }
 
-  loadWeightDump(dump: WeightDump): void {
-    loadWeights(this.online, dump);
+  loadWeightDump(dumps: WeightDump[]): void {
+    loadWeights(this.online, dumps[0]);
     this.syncTarget();
   }
 

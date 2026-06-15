@@ -4,6 +4,7 @@ import { useStore } from '../../state/store';
 import { EPISODIC_FORMULAS, getAlgoEntry, type FormulaKind } from '../../algos/registry';
 import type { UpdateInfo } from '../../core/types';
 import { DqnDashboard } from './DqnDashboard';
+import { PpoDashboard } from './PpoDashboard';
 
 const f = (x: number | undefined) => (x === undefined || !Number.isFinite(x) ? '0.000' : x.toFixed(3));
 const RED = '#e06c75';
@@ -29,6 +30,8 @@ function symbolicOf(formula: FormulaKind): string {
       return String.raw`\theta(s,a) \leftarrow \theta(s,a) + \alpha\,\gamma^t\,G_t\,(\mathbf{1}[a=a_t] - \pi(a\mid s))`;
     case 'dqn':
       return String.raw`\mathcal{L}(\theta) = \text{Huber}\!\big(y - Q_\theta(s,a)\big),\ \ y = r + \gamma\,Q_{\theta^-}\!\big(s',\,\arg\max_{a'}Q_\theta(s',a')\big)`;
+    case 'ppo':
+      return String.raw`L^{CLIP}(\theta) = \mathbb{E}_t\big[\min(r_t(\theta)\hat{A}_t,\ \mathrm{clip}(r_t(\theta),1-\epsilon,1+\epsilon)\hat{A}_t)\big]`;
   }
 }
 
@@ -76,7 +79,7 @@ export function UpdateRulePanel() {
   const episodic = EPISODIC_FORMULAS.includes(formula);
 
   // Deep RL has no hand-derivable per-step update — show the training dashboard instead.
-  if (entry.deep) return <DqnDashboard />;
+  if (entry.deep) return entry.formula === 'ppo' ? <PpoDashboard /> : <DqnDashboard />;
 
   const justEnded =
     phase === 'result' && !!lastStep && (lastStep.terminated || lastStep.truncated) && !!lastEpisodeUpdate;

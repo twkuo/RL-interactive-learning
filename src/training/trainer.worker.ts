@@ -7,9 +7,10 @@ import { setWasmPaths } from '@tensorflow/tfjs-backend-wasm';
 import wasmSimdPath from '@tensorflow/tfjs-backend-wasm/dist/tfjs-backend-wasm-simd.wasm?url';
 import wasmThreadedSimdPath from '@tensorflow/tfjs-backend-wasm/dist/tfjs-backend-wasm-threaded-simd.wasm?url';
 import wasmPath from '@tensorflow/tfjs-backend-wasm/dist/tfjs-backend-wasm.wasm?url';
-import type { VecEnvironment } from '../core/types';
+import type { Agent, VecEnvironment } from '../core/types';
 import { getEnvEntry } from '../envs/registry';
 import { DQN } from '../algos/deep/DQN';
+import { PPO, type Rollout } from '../algos/deep/PPO';
 import type { WeightDump } from '../core/nn/weights';
 import type { FromWorker, StartMsg, ToWorker } from './protocol';
 
@@ -27,9 +28,10 @@ let backendReady: Promise<void> | null = null;
 // Persisted across "start" messages so consecutive Train presses CONTINUE the same network
 // (weights, replay buffer, and ε all carry over). A fresh run (or a reset) rebuilds it.
 let dqnAgent: DQN | null = null;
+let ppoAgent: PPO | null = null;
 // Best policy seen so far (persists across continue-training presses; reset on a fresh run).
 let bestAvg = -Infinity;
-let bestWeights: WeightDump | null = null;
+let bestWeights: WeightDump[] | null = null;
 
 function ensureBackend(): Promise<void> {
   if (!backendReady) {
@@ -57,7 +59,8 @@ ctx.onmessage = async (e: MessageEvent<ToWorker>) => {
     cancelled = false;
     try {
       await ensureBackend();
-      await runDQN(msg);
+      if (msg.algoId === 'ppo') await runPPO(msg);
+      else await runDQN(msg);
     } catch (err) {
       post({ type: 'error', message: err instanceof Error ? err.message : String(err) });
     }
@@ -65,7 +68,7 @@ ctx.onmessage = async (e: MessageEvent<ToWorker>) => {
 };
 
 // Evaluate the current GREEDY policy (no exploration) over n episodes; returns the mean return.
-function greedyEval(agent: DQN, env: VecEnvironment, n: number): number {
+function greedyEval(agent: Agent, env: VecEnvironment, n: number): number {
   let total = 0;
   for (let e = 0; e < n; e++) {
     let o = env.resetSync();
@@ -180,4 +183,120 @@ async function runDQN(msg: StartMsg): Promise<void> {
     bestAvg: keepBest && bestWeights ? bestAvg : finalGreedy,
   });
   // Keep the agent alive so the next Train can continue from here (disposed on a fresh run).
+}
+
+async function runPPO(msg: StartMsg): Promise<void> {
+  const env = getEnvEntry(msg.envId).create(msg.seed) as VecEnvironment;
+  env.maxSteps = msg.maxSteps;
+  for (const p of msg.rewardParams) env.setRewardParam?.(p.key, p.value);
+  const evalEnv = getEnvEntry(msg.envId).create(msg.seed + 7) as VecEnvironment;
+  evalEnv.maxSteps = msg.maxSteps;
+  for (const p of msg.rewardParams) evalEnv.setRewardParam?.(p.key, p.value);
+
+  const obs = env.observationSpace;
+  const inputDim = obs.shape[0];
+  const nActions = env.actionSpace.kind === 'discrete' ? env.actionSpace.n : 1;
+
+  let agent: PPO;
+  if (msg.fresh || !ppoAgent) {
+    ppoAgent?.dispose();
+    agent = new PPO(inputDim, nActions, env.actionMeanings(), msg.hyperparams, obs.low, obs.high, msg.seed + 1);
+    ppoAgent = agent;
+    bestAvg = -Infinity;
+    bestWeights = null;
+  } else {
+    agent = ppoAgent;
+  }
+  const keepBest = (msg.hyperparams.keepBest ?? 1) >= 0.5;
+  const rolloutLen = Math.round(msg.hyperparams.rolloutLen ?? 1024);
+
+  const returns: number[] = [];
+  const recent: number[] = [];
+  let metrics = { policyLoss: 0, valueLoss: 0, entropy: 0, approxKL: 0, clipFrac: 0 };
+  const roll: Rollout = {
+    states: [],
+    actions: [],
+    logps: [],
+    rewards: [],
+    values: [],
+    nextVals: [],
+    boundaries: [],
+  };
+  let totalSteps = 0;
+  let epRet = 0;
+  let epCount = 0;
+  let s = env.resetSync() as number[];
+
+  while (epCount < msg.episodes && !cancelled) {
+    const step = agent.rolloutAction(s);
+    const r = env.stepSync(step.action);
+    const s2 = r.observation as number[];
+    const finished = r.terminated || r.truncated;
+    roll.states.push(s);
+    roll.actions.push(step.action);
+    roll.logps.push(step.logp);
+    roll.rewards.push(r.reward);
+    roll.values.push(step.value);
+    roll.nextVals.push(r.terminated ? 0 : agent.stateValue(s2));
+    roll.boundaries.push(finished ? 1 : 0);
+    epRet += r.reward;
+    totalSteps += 1;
+    s = s2;
+
+    if (roll.states.length >= rolloutLen) {
+      metrics = agent.learn(roll);
+      roll.states = [];
+      roll.actions = [];
+      roll.logps = [];
+      roll.rewards = [];
+      roll.values = [];
+      roll.nextVals = [];
+      roll.boundaries = [];
+    }
+
+    if (finished) {
+      epCount += 1;
+      returns.push(epRet);
+      recent.push(epRet);
+      if (recent.length > 30) recent.shift();
+      const avgReturn = recent.reduce((x, y) => x + y, 0) / recent.length;
+      post({
+        type: 'progress',
+        episode: epCount,
+        ret: epRet,
+        avgReturn,
+        metrics: {
+          policyLoss: metrics.policyLoss,
+          valueLoss: metrics.valueLoss,
+          entropy: metrics.entropy,
+          approxKL: metrics.approxKL,
+          clipFrac: metrics.clipFrac,
+          trainSteps: totalSteps,
+        },
+      });
+      if (keepBest && epCount % 15 === 0) {
+        const g = greedyEval(agent, evalEnv, 3);
+        if (g > bestAvg) {
+          bestAvg = g;
+          bestWeights = agent.dumpWeights();
+        }
+      }
+      await new Promise((res) => setTimeout(res, 0));
+      epRet = 0;
+      s = env.resetSync() as number[];
+    }
+  }
+
+  const finalGreedy = greedyEval(agent, evalEnv, 5);
+  if (keepBest && finalGreedy > bestAvg) {
+    bestAvg = finalGreedy;
+    bestWeights = agent.dumpWeights();
+  }
+  post({
+    type: 'done',
+    returns,
+    weights: keepBest && bestWeights ? bestWeights : agent.dumpWeights(),
+    epsilon: 0,
+    bestAvg: keepBest && bestWeights ? bestAvg : finalGreedy,
+  });
 }

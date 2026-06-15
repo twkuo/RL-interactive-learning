@@ -39,7 +39,7 @@ export interface EpisodeReturn {
 
 // Deep agents expose these beyond the base Agent interface (weight transfer + cleanup).
 interface Trainable {
-  loadWeightDump?(w: WeightDump): void;
+  loadWeightDump?(w: WeightDump[]): void;
   setEpsilon?(e: number): void;
   dispose?(): void;
 }
@@ -84,13 +84,9 @@ interface RLState {
   trainingStatus: TrainingStatus;
   trainingEpisode: number;
   trainingTotal: number;
-  lossHistory: number[];
-  tdErrorHistory: number[];
-  bufferFill: number; // 0..1 replay buffer fill fraction
-  trainEpsilon: number;
-  trainStepsCount: number;
-  targetSyncEvery: number;
-  bestAvg: number; // best moving-average return found during training (the policy kept for inference)
+  metricHistory: Record<string, number[]>; // per-metric time series (loss/tdError for DQN; policyLoss/… for PPO)
+  metricLatest: Record<string, number>; // latest scalar metric values (bufferFill, epsilon, approxKL, …)
+  bestAvg: number; // best greedy return found during training (the policy kept for inference)
   trainingError: string | null;
   // ---- actions ----
   setEnv: (id: string) => void;
@@ -235,12 +231,8 @@ function resetTrainingSlice(): Partial<RLState> {
     trainingStatus: 'idle',
     trainingEpisode: 0,
     trainingTotal: 0,
-    lossHistory: [],
-    tdErrorHistory: [],
-    bufferFill: 0,
-    trainEpsilon: 0,
-    trainStepsCount: 0,
-    targetSyncEvery: 0,
+    metricHistory: {},
+    metricLatest: {},
     bestAvg: 0,
     trainingError: null,
   };
@@ -260,18 +252,18 @@ export const useStore = create<RLState>((set, get) => {
     worker.onmessage = (e: MessageEvent<FromWorker>) => {
       const msg = e.data;
       if (msg.type === 'progress') {
-        set((s) => ({
-          trainingEpisode: msg.episode,
-          // Append with a cumulative index so the curve continues smoothly across Train presses.
-          episodeReturns: [...s.episodeReturns, { episode: s.episodeReturns.length + 1, return: msg.ret }],
-          lossHistory: [...s.lossHistory, msg.metrics.loss],
-          tdErrorHistory: [...s.tdErrorHistory, msg.metrics.tdError],
-          bufferFill: msg.metrics.bufferFill,
-          trainEpsilon: msg.metrics.epsilon,
-          trainStepsCount: msg.metrics.trainSteps,
-          targetSyncEvery: msg.metrics.targetSync,
-          tick: s.tick + 1,
-        }));
+        set((s) => {
+          const hist: Record<string, number[]> = { ...s.metricHistory };
+          for (const k in msg.metrics) hist[k] = [...(hist[k] ?? []), msg.metrics[k]];
+          return {
+            trainingEpisode: msg.episode,
+            // Append with a cumulative index so the curve continues smoothly across Train presses.
+            episodeReturns: [...s.episodeReturns, { episode: s.episodeReturns.length + 1, return: msg.ret }],
+            metricHistory: hist,
+            metricLatest: msg.metrics,
+            tick: s.tick + 1,
+          };
+        });
       } else if (msg.type === 'done') {
         sessionTrained = true; // worker now holds a trained agent → the next Train continues it
         const ag = get().agent as unknown as Trainable;
@@ -282,7 +274,6 @@ export const useStore = create<RLState>((set, get) => {
           const d = get().agent.act(get().currentState);
           set((s) => ({
             trainingStatus: 'done',
-            trainEpsilon: msg.epsilon,
             bestAvg: msg.bestAvg,
             phase: 'deciding',
             revealed: false,
@@ -399,12 +390,8 @@ export const useStore = create<RLState>((set, get) => {
     trainingStatus: 'idle',
     trainingEpisode: 0,
     trainingTotal: 0,
-    lossHistory: [],
-    tdErrorHistory: [],
-    bufferFill: 0,
-    trainEpsilon: 0,
-    trainStepsCount: 0,
-    targetSyncEvery: 0,
+    metricHistory: {},
+    metricLatest: {},
     bestAvg: 0,
     trainingError: null,
 
@@ -603,17 +590,7 @@ export const useStore = create<RLState>((set, get) => {
         trainingTotal: episodes,
         trainingError: null,
         // Fresh run clears the curves + ε display; a continuation keeps appending to them.
-        ...(fresh
-          ? {
-              episodeReturns: [],
-              lossHistory: [],
-              tdErrorHistory: [],
-              trainStepsCount: 0,
-              bufferFill: 0,
-              bestAvg: 0,
-              trainEpsilon: st.hyperparams.epsilon ?? 1,
-            }
-          : {}),
+        ...(fresh ? { episodeReturns: [], metricHistory: {}, metricLatest: {}, bestAvg: 0 } : {}),
         tick: s.tick + 1,
       }));
       const startMsg: StartMsg = {
