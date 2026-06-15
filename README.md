@@ -56,6 +56,16 @@ npm run test      # unit tests (Vitest)
 
 Continuous environments run real physics internally. For the **tabular** algorithms they are **discretized** (state aggregation) into a finite index, so the same agents work on them unchanged. The **deep-RL** algorithms (DQN, PPO) instead read the **raw continuous vector** directly — no discretization.
 
+## Physics & fidelity
+
+There is **no third-party physics engine** — every environment is hand-written numerical integration in plain TypeScript (TensorFlow.js is only for the neural networks). The whole app stays dependency-light and runs entirely in the browser.
+
+- **Classic control** (CartPole, MountainCar, Acrobot, Pendulum) ports Gymnasium's exact equations of motion and physical constants — masses, lengths, gravity, force/torque magnitudes, thresholds, timesteps. Gymnasium's own classic-control environments are engine-free as well (pure NumPy ODEs), so these match in both the equations and the approach.
+- **Integrators** — how the differential equations are stepped forward by Δt:
+  - *Explicit (forward) Euler* — CartPole, MountainCar, Pendulum. The simplest scheme: advance each quantity using its rate of change at the **current** state (`next = current + rate · Δt`). One derivative evaluation per step — cheap, fast, and accurate enough at small Δt.
+  - *RK4 (4th-order Runge–Kutta)* — Acrobot. Samples the dynamics four times per step and averages them, which is far more accurate for the sensitive two-link arm.
+- **LunarLander is the exception.** The real Gymnasium LunarLander runs on the **Box2D** rigid-body engine; porting Box2D to the browser isn't practical, so this is a **simplified custom approximation** — a point-mass lander with gravity, a main engine, and side-engine torque, plus a Gymnasium-style shaping reward. It captures the task (descend, orient, land gently on the pad) but is **not** a Box2D-faithful reproduction. A real 2D engine (e.g. a WASM build of Box2D) would be the natural upgrade for higher fidelity.
+
 ## Algorithms
 
 **Tabular** (an exact table of Q / π over discrete states):
