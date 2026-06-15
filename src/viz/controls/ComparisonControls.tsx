@@ -1,7 +1,8 @@
 // Experiment comparison controls: build overlaid learning curves and manage them (also the legend).
-//  - Tabular: "Run current config & add" runs a fresh controlled agent (synchronous).
-//  - Any algo (incl. DQN): "Pin current learning curve" persists the run you already trained
-//    (no re-run) so you can overlay e.g. DQN vs Q-Learning on the same CartPole task.
+//  - "Run current config & add" trains a fresh controlled agent and adds its curve. Tabular runs
+//    synchronously; deep RL (DQN/PPO) trains in a transient background worker (live progress shown).
+//  - "Pin current learning curve" persists the run you already trained (no re-run), so you can
+//    overlay e.g. DQN vs PPO vs Q-Learning on the same task.
 import { useStore } from '../../state/store';
 import { getAlgoEntry } from '../../algos/registry';
 import { CURRENT_RUN_COLOR } from '../charts/RewardChart';
@@ -22,8 +23,12 @@ export function ComparisonControls() {
   const clearComparisonRuns = useStore((s) => s.clearComparisonRuns);
   const episodeReturns = useStore((s) => s.episodeReturns);
   const algoId = useStore((s) => s.algoId);
+  const compareStatus = useStore((s) => s.compareStatus);
+  const compareProgress = useStore((s) => s.compareProgress);
+  const compareTotal = useStore((s) => s.compareTotal);
 
   const deep = !!getAlgoEntry(algoId).deep;
+  const comparing = compareStatus === 'running';
   const hasCurrent = episodeReturns.length > 0;
   const hasLegend = comparisonRuns.length > 0 || hasCurrent;
 
@@ -31,24 +36,25 @@ export function ComparisonControls() {
     <div className="panel">
       <div className="panel-title">Compare Configurations (algorithm / hyperparameters)</div>
 
-      {!deep && (
-        <div className="compare-row">
-          <label className="compare-eps">
-            Episodes per run
-            <input
-              type="number"
-              min={10}
-              max={5000}
-              step={50}
-              value={compareEpisodes}
-              onChange={(e) => setCompareEpisodes(Math.max(10, parseInt(e.target.value, 10) || 10))}
-            />
-          </label>
-          <button className="btn btn-primary compare-run" onClick={runComparison}>
-            Run current config & add to comparison
-          </button>
-        </div>
-      )}
+      <div className="compare-row">
+        <label className="compare-eps">
+          Episodes per run
+          <input
+            type="number"
+            min={10}
+            max={5000}
+            step={50}
+            value={compareEpisodes}
+            disabled={comparing}
+            onChange={(e) => setCompareEpisodes(Math.max(10, parseInt(e.target.value, 10) || 10))}
+          />
+        </label>
+        <button className="btn btn-primary compare-run" onClick={runComparison} disabled={comparing}>
+          {comparing
+            ? `Training a fresh agent… ${compareProgress}/${compareTotal}`
+            : 'Run current config & add to comparison'}
+        </button>
+      </div>
 
       <button className="btn" onClick={snapshotCurrentRun} disabled={!hasCurrent}>
         Pin current learning curve to comparison
@@ -56,7 +62,7 @@ export function ComparisonControls() {
 
       <div className="hint">
         {deep
-          ? 'Train DQN on the left, then pin its curve here. Switching between DQN and a tabular method on CartPole keeps these curves — so you can overlay "DQN vs Q-Learning" on the same task.'
+          ? '"Run" trains a fresh agent in a background worker and adds its curve; or "Pin" keeps the agent you already trained. Switching DQN / PPO / tabular on the same task keeps the curves — so you can overlay them.'
           : 'Run a fresh controlled agent and overlay it, or pin the current interactive curve. Switching algorithms keeps the curves as long as the environment stays the same task.'}
       </div>
 

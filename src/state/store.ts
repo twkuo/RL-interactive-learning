@@ -84,6 +84,9 @@ interface RLState {
   comparisonRuns: ComparisonRun[];
   compareEpisodes: number;
   runCounter: number;
+  compareStatus: 'idle' | 'running'; // a deep "Run & add" comparison run is training in a transient worker
+  compareProgress: number;
+  compareTotal: number;
   isPlaying: boolean;
   tick: number; // triggers a canvas redraw
   // ---- deep-RL training slice (Web Worker) ----
@@ -185,6 +188,19 @@ function autoLabel(algoId: string, hp: Record<string, number>): string {
   let label = `${entry.name} α${hp.alpha.toFixed(2)} γ${hp.gamma.toFixed(2)}`;
   if (entry.usesEpsilon) label += ` ε${hp.epsilon.toFixed(2)}`;
   return label;
+}
+
+// Suffix describing how the current env's reward / maxSteps differ from its defaults (for run labels).
+function comparisonSuffix(envId: string, env: AnyEnv, maxSteps: number): string {
+  const tmp = getEnvEntry(envId).create(SEED);
+  const defParams = tmp.rewardParams?.() ?? [];
+  const defMax = tmp.maxSteps;
+  const defMap = new Map(defParams.map((d) => [d.key, d.value]));
+  const diffs = (env.rewardParams?.() ?? [])
+    .filter((p) => Math.abs(p.value - (defMap.get(p.key) ?? p.value)) > 1e-9)
+    .map((p) => `${p.label}${+p.value.toFixed(3)}`);
+  if (maxSteps !== defMax) diffs.push(`maxSteps${maxSteps}`);
+  return diffs.length ? ' · ' + diffs.join(' ') : '';
 }
 
 // Pick an env compatible with the algorithm (deep needs continuous/box obs; tabular needs discrete).
@@ -306,6 +322,47 @@ export const useStore = create<RLState>((set, get) => {
     return worker;
   };
 
+  // ---- transient worker for a deep "Run & add to comparison": trains a FRESH agent headlessly and
+  // adds its learning curve, without touching the interactive agent; terminated when done. ----
+  const startCompareWorker = (st: RLState) => {
+    const w = new Worker(new URL('../training/trainer.worker.ts', import.meta.url), { type: 'module' });
+    const label = autoLabel(st.algoId, st.hyperparams) + comparisonSuffix(st.envId, st.env, st.maxSteps);
+    const color = COMPARE_PALETTE[st.runCounter % COMPARE_PALETTE.length];
+    const rewardParams = (st.env.rewardParams?.() ?? []).map((p) => ({ key: p.key, value: p.value }));
+    w.onmessage = (e: MessageEvent<FromWorker>) => {
+      const msg = e.data;
+      if (msg.type === 'progress') {
+        set((s) => ({ compareProgress: msg.episode, tick: s.tick + 1 }));
+      } else if (msg.type === 'done') {
+        const run: ComparisonRun = { id: 'run-' + get().runCounter, label, color, returns: msg.returns };
+        set((s) => ({
+          comparisonRuns: [...s.comparisonRuns, run],
+          runCounter: s.runCounter + 1,
+          compareStatus: 'idle',
+          compareProgress: 0,
+          tick: s.tick + 1,
+        }));
+        w.terminate();
+      } else if (msg.type === 'error') {
+        set((s) => ({ compareStatus: 'idle', compareProgress: 0, trainingError: msg.message, tick: s.tick + 1 }));
+        w.terminate();
+      }
+    };
+    set({ compareStatus: 'running', compareProgress: 0, compareTotal: st.compareEpisodes });
+    const startMsg: StartMsg = {
+      type: 'start',
+      algoId: st.algoId,
+      envId: st.envId,
+      hyperparams: { ...st.hyperparams, keepBest: 0 }, // skip greedy-eval overhead; we only need the returns
+      rewardParams,
+      maxSteps: st.maxSteps,
+      episodes: st.compareEpisodes,
+      seed: SEED,
+      fresh: true,
+    };
+    w.postMessage(startMsg);
+  };
+
   // ---- (re)create the agent for the current env+algo, sync (tabular) or async (deep). ----
   const buildAgent = (envId: string, algoId: string, env: AnyEnv, hp: Record<string, number>, extra: Partial<RLState>) => {
     const entry = getAlgoEntry(algoId);
@@ -400,6 +457,9 @@ export const useStore = create<RLState>((set, get) => {
     comparisonRuns: [],
     compareEpisodes: 300,
     runCounter: 0,
+    compareStatus: 'idle',
+    compareProgress: 0,
+    compareTotal: 0,
     isPlaying: false,
     tick: 0,
     trainingStatus: 'idle',
@@ -663,24 +723,22 @@ export const useStore = create<RLState>((set, get) => {
 
     runComparison: () => {
       const st = get();
-      if (getAlgoEntry(st.algoId).deep) return; // deep comparison is added later (async worker path)
+      const entry = getAlgoEntry(st.algoId);
+      if (entry.deep) {
+        // Async: train a fresh agent in a transient worker, then add its curve (see startCompareWorker).
+        if (st.compareStatus === 'running' || st.trainingStatus === 'running') return;
+        startCompareWorker(st);
+        return;
+      }
+      // Tabular: synchronous headless run with a fresh agent + env.
       const tmpEnv = getEnvEntry(st.envId).create(SEED) as TabularEnvironment;
-      const defParams = tmpEnv.rewardParams?.() ?? [];
-      const defMax = tmpEnv.maxSteps;
       tmpEnv.maxSteps = st.maxSteps;
-      const curParams = st.env.rewardParams?.() ?? [];
-      curParams.forEach((p) => tmpEnv.setRewardParam?.(p.key, p.value));
-      const tmpAgent = getAlgoEntry(st.algoId).create!(tmpEnv, st.hyperparams);
+      (st.env.rewardParams?.() ?? []).forEach((p) => tmpEnv.setRewardParam?.(p.key, p.value));
+      const tmpAgent = entry.create!(tmpEnv, st.hyperparams);
       const { returns } = runEpisodes(tmpEnv, tmpAgent, st.compareEpisodes);
-      const defMap = new Map(defParams.map((d) => [d.key, d.value]));
-      const diffs = curParams
-        .filter((p) => Math.abs(p.value - (defMap.get(p.key) ?? p.value)) > 1e-9)
-        .map((p) => `${p.label}${+p.value.toFixed(3)}`);
-      if (st.maxSteps !== defMax) diffs.push(`maxSteps${st.maxSteps}`);
-      const suffix = diffs.length ? ' · ' + diffs.join(' ') : '';
       const run: ComparisonRun = {
         id: 'run-' + st.runCounter,
-        label: autoLabel(st.algoId, st.hyperparams) + suffix,
+        label: autoLabel(st.algoId, st.hyperparams) + comparisonSuffix(st.envId, st.env, st.maxSteps),
         color: COMPARE_PALETTE[st.runCounter % COMPARE_PALETTE.length],
         returns,
       };
