@@ -16,7 +16,13 @@ import type {
   UpdateInfo,
 } from '../core/types';
 import { ENV_REGISTRY, getEnvEntry } from '../envs/registry';
-import { DEFAULT_HYPERPARAMS, defaultHyperparams, getAlgoEntry } from '../algos/registry';
+import {
+  ALGO_REGISTRY,
+  DEFAULT_HYPERPARAMS,
+  algoSupportsEnv,
+  defaultHyperparams,
+  getAlgoEntry,
+} from '../algos/registry';
 import type { FromWorker, StartMsg, ToWorker } from '../training/protocol';
 import type { WeightDump } from '../core/nn/weights';
 
@@ -183,15 +189,24 @@ function autoLabel(algoId: string, hp: Record<string, number>): string {
 
 // Pick an env compatible with the algorithm (deep needs continuous/box obs; tabular needs discrete).
 function compatibleEnvId(curEnvId: string, algoId: string): string {
+  const algo = getAlgoEntry(algoId);
   const cur = getEnvEntry(curEnvId);
-  const needBox = getAlgoEntry(algoId).requires === 'box-obs';
-  const ok = (e: { obsKind: 'discrete' | 'box' }) => (needBox ? e.obsKind === 'box' : e.obsKind !== 'box');
-  if (ok(cur)) return curEnvId; // already compatible
+  if (algoSupportsEnv(algo, cur)) return curEnvId; // already compatible
   // Prefer a compatible env in the SAME comparison group (e.g. cartpole-vec <-> cartpole), so
   // switching DQN <-> tabular stays on the same task and keeps the comparison chart intact.
-  const sameGroup = ENV_REGISTRY.find((e) => e.compareGroup === cur.compareGroup && ok(e));
+  const sameGroup = ENV_REGISTRY.find((e) => e.compareGroup === cur.compareGroup && algoSupportsEnv(algo, e));
   if (sameGroup) return sameGroup.id;
-  return needBox ? DEFAULT_BOX_ENV : DEFAULT_DISCRETE_ENV;
+  const any = ENV_REGISTRY.find((e) => algoSupportsEnv(algo, e));
+  if (any) return any.id;
+  return algo.requires === 'box-obs' ? DEFAULT_BOX_ENV : DEFAULT_DISCRETE_ENV;
+}
+
+// When switching environments, pick an algorithm compatible with the new env (keep current if it fits).
+function compatibleAlgoId(envId: string, curAlgoId: string): string {
+  const env = getEnvEntry(envId);
+  if (algoSupportsEnv(getAlgoEntry(curAlgoId), env)) return curAlgoId;
+  const any = ALGO_REGISTRY.find((a) => algoSupportsEnv(a, env));
+  return any ? any.id : curAlgoId;
 }
 
 // Identity of an algorithm's hyperparameter "shape": switching between algos with the same shape
@@ -396,9 +411,12 @@ export const useStore = create<RLState>((set, get) => {
     trainingError: null,
 
     setEnv: (id) => {
+      const algoId = compatibleAlgoId(id, get().algoId);
       const groupChanged = getEnvEntry(id).compareGroup !== getEnvEntry(get().envId).compareGroup;
       const e = getEnvEntry(id).create(SEED);
-      buildAgent(id, get().algoId, e, get().hyperparams, groupChanged ? { comparisonRuns: [] } : {});
+      const hyperparams =
+        algoId === get().algoId ? get().hyperparams : defaultHyperparams(getAlgoEntry(algoId));
+      buildAgent(id, algoId, e, hyperparams, groupChanged ? { comparisonRuns: [] } : {});
     },
 
     setAlgo: (id) => {

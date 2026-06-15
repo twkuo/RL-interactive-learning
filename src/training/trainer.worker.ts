@@ -10,7 +10,7 @@ import wasmPath from '@tensorflow/tfjs-backend-wasm/dist/tfjs-backend-wasm.wasm?
 import type { Agent, VecEnvironment } from '../core/types';
 import { getEnvEntry } from '../envs/registry';
 import { DQN } from '../algos/deep/DQN';
-import { PPO, type Rollout } from '../algos/deep/PPO';
+import { PPO, specOf, type Rollout } from '../algos/deep/PPO';
 import type { WeightDump } from '../core/nn/weights';
 import type { FromWorker, StartMsg, ToWorker } from './protocol';
 
@@ -195,12 +195,11 @@ async function runPPO(msg: StartMsg): Promise<void> {
 
   const obs = env.observationSpace;
   const inputDim = obs.shape[0];
-  const nActions = env.actionSpace.kind === 'discrete' ? env.actionSpace.n : 1;
 
   let agent: PPO;
   if (msg.fresh || !ppoAgent) {
     ppoAgent?.dispose();
-    agent = new PPO(inputDim, nActions, env.actionMeanings(), msg.hyperparams, obs.low, obs.high, msg.seed + 1);
+    agent = new PPO(inputDim, obs.low, obs.high, specOf(env), msg.hyperparams, msg.seed + 1);
     ppoAgent = agent;
     bestAvg = -Infinity;
     bestWeights = null;

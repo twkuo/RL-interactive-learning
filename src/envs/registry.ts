@@ -4,9 +4,12 @@ import { GridWorld, type GridWorldConfig } from './discrete/GridWorld';
 import { makeFrozenLake } from './discrete/FrozenLake';
 import { CartPole } from './continuous/CartPole';
 import { CartPoleVec } from './continuous/CartPoleVec';
+import { Acrobot } from './continuous/Acrobot';
+import { Pendulum } from './continuous/Pendulum';
+import { LunarLander } from './continuous/LunarLander';
 import { MountainCar } from './continuous/MountainCar';
 
-export type RenderKind = 'grid' | 'cartpole' | 'mountaincar';
+export type RenderKind = 'grid' | 'cartpole' | 'mountaincar' | 'acrobot' | 'pendulum' | 'lunarlander';
 
 // Default 5x5 GridWorld (deterministic, making it easy to observe argmax -> movement).
 //   . . . . .
@@ -100,6 +103,36 @@ export const ENV_REGISTRY: EnvEntry[] = [
     compareGroup: 'cartpole', // same group as the tabular CartPole → comparable returns
     deep: true,
     create: (seed) => new CartPoleVec(seed),
+  },
+  {
+    id: 'acrobot',
+    name: 'Acrobot',
+    renderKind: 'acrobot',
+    obsKind: 'box',
+    actionKind: 'discrete',
+    compareGroup: 'acrobot',
+    deep: true,
+    create: (seed) => new Acrobot(seed),
+  },
+  {
+    id: 'pendulum',
+    name: 'Pendulum',
+    renderKind: 'pendulum',
+    obsKind: 'box',
+    actionKind: 'continuous',
+    compareGroup: 'pendulum',
+    deep: true,
+    create: (seed) => new Pendulum(seed),
+  },
+  {
+    id: 'lunarlander',
+    name: 'LunarLander',
+    renderKind: 'lunarlander',
+    obsKind: 'box',
+    actionKind: 'discrete',
+    compareGroup: 'lunarlander',
+    deep: true,
+    create: (seed) => new LunarLander(seed),
   },
 ];
 

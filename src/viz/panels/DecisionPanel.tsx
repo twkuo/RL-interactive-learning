@@ -13,6 +13,46 @@ export function DecisionPanel() {
   const revealAction = useStore((s) => s.revealAction);
 
   if (!explanation) return null;
+
+  // Continuous (Gaussian) policy: no discrete actions to bar-chart — show μ, σ, and the sample.
+  if (explanation.policyKind === 'gaussian') {
+    const mean = explanation.mean ?? 0;
+    const std = explanation.std ?? 0;
+    const sampled = explanation.continuousAction ?? mean;
+    const label = explanation.actionMeanings[0] ?? 'action';
+    return (
+      <div className="panel">
+        <div className="panel-title">Action Selection Breakdown</div>
+        <div className="hint">
+          Continuous Gaussian policy: the network outputs a mean μ and a spread σ; the action is
+          sampled from N(μ, σ) and clamped to the valid range.
+        </div>
+        <div className="kv-row">
+          <span>Mean μ</span>
+          <span className="mono">{mean.toFixed(3)}</span>
+        </div>
+        <div className="kv-row">
+          <span>Std σ (exploration)</span>
+          <span className="mono">{std.toFixed(3)}</span>
+        </div>
+        {phase === 'deciding' && !revealed && (
+          <button className="btn btn-reveal" onClick={revealAction}>
+            Reveal action
+          </button>
+        )}
+        {revealed && (
+          <div className="reveal-box">
+            <div className="kv-row">
+              <span>Sampled {label}</span>
+              <b className="mono">{sampled.toFixed(3)}</b>
+            </div>
+            <div className="rationale">{explanation.rationale}</div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
   const meanings = explanation.actionMeanings;
   const isQ = explanation.qValues != null;
   const values = explanation.qValues ?? explanation.actionProbs ?? [];

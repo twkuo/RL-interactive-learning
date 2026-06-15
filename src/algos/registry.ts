@@ -1,5 +1,6 @@
 // Algorithm registry: factory + UI hints (whether ε is used, which update-formula template).
 import type { Agent, SyncEnvironment, TabularEnvironment } from '../core/types';
+import type { EnvEntry } from '../envs/registry';
 import { QLearning } from './tabular/QLearning';
 import { Sarsa } from './tabular/Sarsa';
 import { ExpectedSarsa } from './tabular/ExpectedSarsa';
@@ -40,6 +41,7 @@ export interface AlgoEntry {
   formula: FormulaKind;
   deep?: boolean; // deep RL (neural network); trains off-thread in a Web Worker
   requires?: 'discrete-obs' | 'box-obs'; // environment compatibility
+  continuousAction?: boolean; // supports continuous (box) action spaces — PPO only; DQN/tabular are discrete
   hyperparamSpec?: HyperparamSpec[]; // when present, the HyperParams panel renders from this
   // Tabular algorithms create synchronously. Deep algorithms load lazily via dynamic import,
   // which keeps TensorFlow.js out of the main bundle (tabular experience stays tfjs-free).
@@ -94,7 +96,16 @@ const PPO_HP: HyperparamSpec[] = [
   { key: 'gamma', label: 'Discount γ', min: 0.8, max: 1, step: 0.01, default: 0.99, decimals: 2 },
   { key: 'gaeLambda', label: 'GAE λ', min: 0.8, max: 1, step: 0.01, default: 0.95, decimals: 2 },
   { key: 'clip', label: 'Clip ε', min: 0.05, max: 0.5, step: 0.05, default: 0.2, decimals: 2 },
-  { key: 'entropyCoef', label: 'Entropy coef', min: 0, max: 0.05, step: 0.005, default: 0.01, decimals: 3 },
+  {
+    key: 'entropyCoef',
+    label: 'Entropy coef',
+    min: 0,
+    max: 0.05,
+    step: 0.005,
+    default: 0,
+    decimals: 3,
+    hint: 'Entropy bonus. Keep ~0 for continuous (Gaussian) actions — its entropy is unbounded, so a positive coef inflates the std.',
+  },
   { key: 'epochs', label: 'Epochs / update', min: 1, max: 15, step: 1, default: 6, decimals: 0 },
   { key: 'rolloutLen', label: 'Rollout length (steps)', min: 256, max: 4096, step: 256, default: 1024, decimals: 0 },
   { key: 'hiddenUnits', label: 'Hidden units', min: 16, max: 256, step: 16, default: 64, decimals: 0 },
@@ -202,6 +213,7 @@ export const ALGO_REGISTRY: AlgoEntry[] = [
     formula: 'ppo',
     deep: true,
     requires: 'box-obs',
+    continuousAction: true,
     hyperparamSpec: PPO_HP,
     load: () => import('./deep/PPO'),
   },
@@ -209,6 +221,14 @@ export const ALGO_REGISTRY: AlgoEntry[] = [
 
 export function getAlgoEntry(id: string): AlgoEntry {
   return ALGO_REGISTRY.find((a) => a.id === id) ?? ALGO_REGISTRY[0];
+}
+
+// Whether an algorithm can run on an environment: observation encoding must match, and continuous
+// action spaces require an algorithm that supports them (PPO).
+export function algoSupportsEnv(algo: AlgoEntry, env: EnvEntry): boolean {
+  const obsOk = algo.requires === 'box-obs' ? env.obsKind === 'box' : env.obsKind !== 'box';
+  const actionOk = env.actionKind === 'continuous' ? !!algo.continuousAction : true;
+  return obsOk && actionOk;
 }
 
 // Default hyperparameters for an algorithm: deep algos use their spec defaults; tabular use the shared set.

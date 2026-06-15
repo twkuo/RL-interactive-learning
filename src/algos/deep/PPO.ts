@@ -1,12 +1,14 @@
 // Proximal Policy Optimization (PPO) — actor-critic, GAE(λ) advantages, clipped surrogate
 // objective, value loss, and an entropy bonus, trained over minibatch epochs on rollouts.
 //
-// Like DQN this module statically imports TensorFlow.js and must only be reached via a DYNAMIC
-// import (registry `() => import('./deep/PPO')` and the training worker), keeping tfjs out of the
-// main bundle.
+// Supports BOTH action kinds:
+//   - discrete   → softmax policy (actor outputs logits over n actions)
+//   - continuous → diagonal Gaussian policy (actor outputs [mean, log-std] for a 1-D action,
+//                  sampled and clamped to the action bounds; e.g. Pendulum torque)
 //
-// Main thread: actor for synchronous act() (samples from π, drives the DecisionPanel) + critic for
-// V(s). update() is a no-op — learning happens in the worker via rollout collection + learn().
+// Like DQN this statically imports TensorFlow.js and must only be reached via a DYNAMIC import.
+// Main thread: actor for synchronous act() + critic for V(s). update() is a no-op — learning runs
+// in the worker via rollout collection + learn().
 import * as tf from '@tensorflow/tfjs';
 import type {
   Action,
@@ -30,7 +32,8 @@ export interface PPOMetrics {
   clipFrac: number;
 }
 
-// A collected rollout (built by the worker). nextVals are already zeroed on terminated steps;
+// A collected rollout (built by the worker). For discrete actions, `actions` holds indices; for
+// continuous, it holds the scalar (clamped) action. nextVals are zeroed on terminated steps;
 // boundaries mark episode ends (terminated OR truncated) so GAE doesn't cross episodes.
 export interface Rollout {
   states: number[][];
@@ -42,6 +45,15 @@ export interface Rollout {
   boundaries: number[];
 }
 
+export type PPOActionSpec =
+  | { kind: 'discrete'; n: number; labels: string[] }
+  | { kind: 'continuous'; low: number; high: number; labels: string[] };
+
+const LOG_STD_MIN = -5;
+const LOG_STD_MAX = 0.2; // cap σ ≈ 1.2: a state-dependent log-std can otherwise drift up and make rollouts near-random
+const HALF_LOG_2PI = 0.5 * Math.log(2 * Math.PI);
+const GAUSS_ENTROPY_CONST = 0.5 * Math.log(2 * Math.PI * Math.E);
+
 function sampleFrom(probs: number[], u: number): number {
   let c = 0;
   for (let i = 0; i < probs.length; i++) {
@@ -51,6 +63,15 @@ function sampleFrom(probs: number[], u: number): number {
   return probs.length - 1;
 }
 
+// Standard normal via Box-Muller.
+function gauss(rng: RNG): number {
+  const u1 = Math.max(rng.next(), 1e-9);
+  const u2 = rng.next();
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+
+const clamp = (x: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, x));
+
 export class PPO implements Agent {
   readonly id = 'ppo';
   readonly name = 'PPO';
@@ -58,8 +79,9 @@ export class PPO implements Agent {
   hyperparams: Record<string, number>;
 
   private inputDim: number;
-  private nActions: number;
-  private actionLabels: string[];
+  private spec: PPOActionSpec;
+  private continuous: boolean;
+  private outDim: number; // actor output width: nActions (discrete) or 2 = [mean, log-std] (continuous)
   private rng: RNG;
   private obsCenter: number[];
   private obsHalf: number[];
@@ -81,16 +103,16 @@ export class PPO implements Agent {
 
   constructor(
     inputDim: number,
-    nActions: number,
-    actionLabels: string[],
-    hp: Record<string, number>,
     low: number[],
     high: number[],
+    spec: PPOActionSpec,
+    hp: Record<string, number>,
     seed = 12345,
   ) {
     this.inputDim = inputDim;
-    this.nActions = nActions;
-    this.actionLabels = actionLabels;
+    this.spec = spec;
+    this.continuous = spec.kind === 'continuous';
+    this.outDim = spec.kind === 'continuous' ? 2 : spec.n;
     this.hyperparams = { ...hp };
     this.rng = new RNG(seed);
     this.obsCenter = low.map((lo, i) => (lo + high[i]) / 2);
@@ -110,7 +132,7 @@ export class PPO implements Agent {
   }
 
   private build(): void {
-    this.actor = buildMLP({ inputDim: this.inputDim, hidden: [this.hidden, this.hidden], outputDim: this.nActions });
+    this.actor = buildMLP({ inputDim: this.inputDim, hidden: [this.hidden, this.hidden], outputDim: this.outDim });
     this.critic = buildMLP({ inputDim: this.inputDim, hidden: [this.hidden, this.hidden], outputDim: 1 });
     this.optimizer = tf.train.adam(this.lr);
   }
@@ -122,15 +144,25 @@ export class PPO implements Agent {
     return out;
   }
 
-  private policyProbs(state: number[]): number[] {
+  // Raw actor output for a single state.
+  private actorOut(state: number[]): number[] {
     return tf.tidy(() => {
-      const logits = this.actor.predict(tf.tensor2d([this.norm(state)], [1, this.inputDim])) as tf.Tensor2D;
-      return softmax(Array.from(logits.dataSync()));
+      const o = this.actor.predict(tf.tensor2d([this.norm(state)], [1, this.inputDim])) as tf.Tensor2D;
+      return Array.from(o.dataSync());
     });
   }
 
-  // V(s) from the critic — used for display and (in the worker) GAE bootstrap.
-  // (Named stateValue, not valueOf, to avoid shadowing Object.prototype.valueOf.)
+  // Discrete: π(a|s). (Continuous has no categorical distribution.)
+  private policyProbs(state: number[]): number[] {
+    return softmax(this.actorOut(state));
+  }
+
+  // Continuous: (mean, std) of the Gaussian for a state.
+  private gaussianParams(state: number[]): { mean: number; std: number } {
+    const o = this.actorOut(state);
+    return { mean: o[0], std: Math.exp(clamp(o[1], LOG_STD_MIN, LOG_STD_MAX)) };
+  }
+
   stateValue(state: number[]): number {
     return tf.tidy(() => {
       const v = this.critic.predict(tf.tensor2d([this.norm(state)], [1, this.inputDim])) as tf.Tensor2D;
@@ -138,36 +170,66 @@ export class PPO implements Agent {
     });
   }
 
+  private bounds(): { low: number; high: number } {
+    return this.spec.kind === 'continuous' ? { low: this.spec.low, high: this.spec.high } : { low: 0, high: 0 };
+  }
+
   selectAction(state: Obs, greedy = false): Action {
-    const p = this.policyProbs(state as number[]);
+    const s = state as number[];
+    if (this.continuous) {
+      const { mean, std } = this.gaussianParams(s);
+      const { low, high } = this.bounds();
+      const a = greedy ? mean : mean + std * gauss(this.rng);
+      return clamp(a, low, high);
+    }
+    const p = this.policyProbs(s);
     return greedy ? argmax(p) : sampleFrom(p, this.rng.next());
   }
 
   act(state: Obs, greedy = false): { action: Action; explanation: ActionExplanation } {
     const s = state as number[];
+    if (this.continuous) {
+      const { mean, std } = this.gaussianParams(s);
+      const { low, high } = this.bounds();
+      const a = clamp(greedy ? mean : mean + std * gauss(this.rng), low, high);
+      const label = this.spec.kind === 'continuous' ? this.spec.labels[0] : 'action';
+      return {
+        action: a,
+        explanation: {
+          state: s,
+          actionMeanings: this.spec.labels,
+          policyKind: 'gaussian',
+          mean,
+          std,
+          continuousAction: a,
+          chosenAction: 0,
+          rationale: greedy
+            ? `Greedy: ${label} = mean μ = ${mean.toFixed(2)} (clamped to [${low}, ${high}])`
+            : `Sampled ${label} = ${a.toFixed(2)} from N(μ=${mean.toFixed(2)}, σ=${std.toFixed(2)})`,
+        },
+      };
+    }
     const p = this.policyProbs(s);
     const greedyAction = argmax(p);
     const draw = this.rng.next();
     const action = greedy ? greedyAction : sampleFrom(p, draw);
-    const rationale = greedy
-      ? `Greedy: highest-probability action "${this.actionLabels[greedyAction]}" (π=${p[greedyAction].toFixed(2)})`
-      : `Sampled from the policy π: drew "${this.actionLabels[action]}" (π=${p[action].toFixed(2)})`;
     return {
       action,
       explanation: {
         state: s,
-        actionMeanings: this.actionLabels,
+        actionMeanings: this.spec.labels,
         policyKind: 'softmax',
         actionProbs: p,
         greedyAction,
         randomDraw: draw,
         chosenAction: action,
-        rationale,
+        rationale: greedy
+          ? `Greedy: highest-probability action "${this.spec.labels[greedyAction]}" (π=${p[greedyAction].toFixed(2)})`
+          : `Sampled from the policy π: drew "${this.spec.labels[action]}" (π=${p[action].toFixed(2)})`,
       },
     };
   }
 
-  // Interactive single-step never trains (that happens in the worker via learn()).
   update(_t: Transition): UpdateInfo {
     return {};
   }
@@ -177,20 +239,27 @@ export class PPO implements Agent {
   }
 
   // ---- training (worker) ----
-  // Sample an action for rollout collection, returning log π(a|s) and V(s).
   rolloutAction(state: number[]): { action: number; logp: number; value: number } {
     return tf.tidy(() => {
       const x = tf.tensor2d([this.norm(state)], [1, this.inputDim]);
-      const logits = this.actor.predict(x) as tf.Tensor2D;
-      const logpAll = Array.from(tf.logSoftmax(logits).dataSync());
-      const probs = softmax(Array.from(logits.dataSync()));
-      const action = sampleFrom(probs, this.rng.next());
       const value = (this.critic.predict(x) as tf.Tensor2D).dataSync()[0];
+      const o = Array.from((this.actor.predict(x) as tf.Tensor2D).dataSync());
+      if (this.continuous) {
+        const { low, high } = this.bounds();
+        const mean = o[0];
+        const std = Math.exp(clamp(o[1], LOG_STD_MIN, LOG_STD_MAX));
+        const a = clamp(mean + std * gauss(this.rng), low, high);
+        const z = (a - mean) / std;
+        const logp = -0.5 * z * z - Math.log(std) - HALF_LOG_2PI;
+        return { action: a, logp, value };
+      }
+      const probs = softmax(o);
+      const action = sampleFrom(probs, this.rng.next());
+      const logpAll = Array.from(tf.logSoftmax(tf.tensor1d(o)).dataSync());
       return { action, logp: logpAll[action], value };
     });
   }
 
-  // One PPO update on a rollout: GAE(λ) → normalized advantages → K epochs of minibatch SGD.
   learn(r: Rollout): PPOMetrics {
     const N = r.states.length;
     const adv = new Array<number>(N).fill(0);
@@ -205,11 +274,34 @@ export class PPO implements Agent {
     const std = Math.sqrt(adv.reduce((x, y) => x + (y - mean) * (y - mean), 0) / N) + 1e-8;
     const advN = adv.map((a) => (a - mean) / std);
     const normStates = r.states.map((s) => this.norm(s));
-
     const clip = this.clip;
+    const cont = this.continuous;
+    const nA = this.outDim;
+
+    // Per-minibatch log π(a|s) under the current policy (+ a scalar entropy proxy for the batch).
+    const logpAndEntropy = (
+      S: tf.Tensor2D,
+      acts: number[],
+    ): { logpA: tf.Tensor1D; entropy: tf.Scalar } => {
+      const out = this.actor.predict(S) as tf.Tensor2D;
+      if (cont) {
+        const meanT = out.slice([0, 0], [-1, 1]).reshape([-1]);
+        const logstd = tf.clipByValue(out.slice([0, 1], [-1, 1]).reshape([-1]), LOG_STD_MIN, LOG_STD_MAX);
+        const stdT = logstd.exp();
+        const z = tf.tensor1d(acts).sub(meanT).div(stdT);
+        const logpA = z.square().mul(-0.5).sub(logstd).sub(HALF_LOG_2PI) as tf.Tensor1D;
+        const entropy = logstd.add(GAUSS_ENTROPY_CONST).mean() as tf.Scalar;
+        return { logpA, entropy };
+      }
+      const logpAll = tf.logSoftmax(out);
+      const oneHot = tf.oneHot(tf.tensor1d(acts, 'int32'), nA);
+      const logpA = logpAll.mul(oneHot).sum(1) as tf.Tensor1D;
+      const entropy = tf.softmax(out).mul(logpAll).sum(1).mean().mul(-1) as tf.Scalar;
+      return { logpA, entropy };
+    };
+
     const idx = Array.from({ length: N }, (_, i) => i);
     for (let epoch = 0; epoch < this.epochs; epoch++) {
-      // Fisher-Yates shuffle (seeded RNG for reproducibility).
       for (let i = N - 1; i > 0; i--) {
         const j = this.rng.int(i + 1);
         const tmp = idx[i];
@@ -225,20 +317,15 @@ export class PPO implements Agent {
         const retMb = mb.map((k) => returns[k]);
         tf.tidy(() => {
           const S = tf.tensor2d(sMb);
-          const A = tf.oneHot(tf.tensor1d(aMb, 'int32'), this.nActions);
           const oldlp = tf.tensor1d(oldMb);
           const advT = tf.tensor1d(advMb);
           const retT = tf.tensor1d(retMb);
           this.optimizer.minimize(() => {
-            const logits = this.actor.predict(S) as tf.Tensor2D;
-            const logpAll = tf.logSoftmax(logits);
-            const logpA = logpAll.mul(A).sum(1);
+            const { logpA, entropy } = logpAndEntropy(S, aMb);
             const ratio = logpA.sub(oldlp).exp();
             const surr1 = ratio.mul(advT);
             const surr2 = tf.clipByValue(ratio, 1 - clip, 1 + clip).mul(advT);
             const pLoss = tf.minimum(surr1, surr2).mean().mul(-1);
-            const probs = tf.softmax(logits);
-            const entropy = probs.mul(logpAll).sum(1).mean().mul(-1);
             const v = (this.critic.predict(S) as tf.Tensor2D).reshape([-1]);
             const vLoss = v.sub(retT).square().mean();
             return pLoss.add(vLoss.mul(this.vfCoef)).sub(entropy.mul(this.entropyCoef)) as tf.Scalar;
@@ -247,30 +334,23 @@ export class PPO implements Agent {
       }
     }
 
-    // Diagnostics on the full batch (one forward pass; for the dashboard).
     return tf.tidy(() => {
       const S = tf.tensor2d(normStates);
-      const A = tf.oneHot(tf.tensor1d(r.actions, 'int32'), this.nActions);
-      const logits = this.actor.predict(S) as tf.Tensor2D;
-      const logpAll = tf.logSoftmax(logits);
-      const logpA = logpAll.mul(A).sum(1);
+      const { logpA, entropy } = logpAndEntropy(S, r.actions);
       const oldlp = tf.tensor1d(r.logps);
       const ratio = logpA.sub(oldlp).exp();
       const advT = tf.tensor1d(advN);
       const surr1 = ratio.mul(advT);
       const surr2 = tf.clipByValue(ratio, 1 - clip, 1 + clip).mul(advT);
       const policyLoss = tf.minimum(surr1, surr2).mean().mul(-1).dataSync()[0];
-      const probs = tf.softmax(logits);
-      const entropy = probs.mul(logpAll).sum(1).mean().mul(-1).dataSync()[0];
       const v = (this.critic.predict(S) as tf.Tensor2D).reshape([-1]);
       const valueLoss = v.sub(tf.tensor1d(returns)).square().mean().dataSync()[0];
       const approxKL = oldlp.sub(logpA).mean().dataSync()[0];
       const clipFrac = tf.abs(ratio.sub(1)).greater(clip).cast('float32').mean().dataSync()[0];
-      return { policyLoss, valueLoss, entropy, approxKL, clipFrac };
+      return { policyLoss, valueLoss, entropy: entropy.dataSync()[0], approxKL, clipFrac };
     });
   }
 
-  // ---- weight transfer (worker → main thread): [actor, critic] ----
   dumpWeights(): WeightDump[] {
     return [dumpWeights(this.actor), dumpWeights(this.critic)];
   }
@@ -292,11 +372,16 @@ export class PPO implements Agent {
   }
 }
 
+export function specOf(env: SyncEnvironment): PPOActionSpec {
+  const a = env.actionSpace;
+  if (a.kind === 'discrete') return { kind: 'discrete', n: a.n, labels: env.actionMeanings() };
+  return { kind: 'continuous', low: a.low[0], high: a.high[0], labels: env.actionMeanings() };
+}
+
 export function create(env: SyncEnvironment, hp: Record<string, number>): PPO {
   const obs = env.observationSpace;
   const inputDim = obs.kind === 'box' ? obs.shape[0] : obs.n;
-  const nActions = env.actionSpace.kind === 'discrete' ? env.actionSpace.n : 1;
   const low = obs.kind === 'box' ? obs.low : new Array<number>(inputDim).fill(-1);
   const high = obs.kind === 'box' ? obs.high : new Array<number>(inputDim).fill(1);
-  return new PPO(inputDim, nActions, env.actionMeanings(), hp, low, high);
+  return new PPO(inputDim, low, high, specOf(env), hp);
 }

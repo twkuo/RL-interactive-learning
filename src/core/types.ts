@@ -134,7 +134,7 @@ export interface QFunction {
 }
 
 // ---------- Action selection breakdown (data source for DecisionPanel and predict mode) ----------
-export type PolicyKind = 'epsilon-greedy' | 'softmax' | 'fixed' | 'greedy';
+export type PolicyKind = 'epsilon-greedy' | 'softmax' | 'fixed' | 'greedy' | 'gaussian';
 
 export interface ActionExplanation {
   state: Obs;
@@ -147,6 +147,10 @@ export interface ActionExplanation {
   randomDraw?: number; // the U(0,1) draw consumed by this step
   isExploring?: boolean;
   chosenAction: number;
+  // Continuous (Gaussian) policy: the sampled scalar action and the distribution it came from.
+  continuousAction?: number;
+  mean?: number;
+  std?: number;
   rationale: string; // human-readable rationale
 }
 

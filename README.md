@@ -50,6 +50,9 @@ npm run test      # unit tests (Vitest)
 | FrozenLake 4x4 | discrete | 4 | deterministic or slippery (stochastic) |
 | CartPole | continuous (x, ẋ, θ, θ̇) | 2 | balance the pole; physics from Gymnasium |
 | MountainCar | continuous (x, v) | 3 | drive up the hill; optional reward shaping |
+| Acrobot | continuous (6D) | 3 (torque) | swing the two-link arm above the bar; deep-RL |
+| LunarLander | continuous (8D) | 4 (engines) | land gently on the pad between the flags; deep-RL |
+| Pendulum | continuous (3D) | **continuous** torque | swing up and balance; PPO Gaussian policy |
 
 Continuous environments run real physics internally. For the **tabular** algorithms they are **discretized** (state aggregation) into a finite index, so the same agents work on them unchanged. The **deep-RL** algorithms (DQN, PPO) instead read the **raw continuous vector** directly — no discretization.
 
@@ -78,7 +81,7 @@ Algorithms are environment-agnostic and depend only on the `Environment` interfa
 ```
 src/
 ├─ core/     types, rng, utils, spaces, discretize · nn/{mlp,replayBuffer,weights}
-├─ envs/     registry · discrete/{GridWorld,FrozenLake} · continuous/{CartPole,CartPoleVec,MountainCar}
+├─ envs/     registry · discrete/{GridWorld,FrozenLake} · continuous/{CartPole,CartPoleVec,MountainCar,Acrobot,Pendulum,LunarLander} · physics/
 ├─ algos/    TabularQ · tabular/{QLearning,Sarsa,ExpectedSarsa,DoubleQLearning,MonteCarlo,Reinforce} · deep/{DQN,PPO} · registry
 ├─ training/ trainer.worker (TensorFlow.js) · protocol
 ├─ state/    store (Zustand + step-by-step reveal state machine)

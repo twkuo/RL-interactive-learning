@@ -15,6 +15,7 @@ export function ContinuousStatePanel() {
   const fields = env.describeObs(cur);
   const isBox = entry.obsKind === 'box';
   const tab = !isBox ? (env as TabularEnvironment) : null;
+  const obsDim = env.observationSpace.kind === 'box' ? env.observationSpace.shape[0] : fields.length;
 
   return (
     <div className="panel">
@@ -42,8 +43,8 @@ export function ContinuousStatePanel() {
         </>
       ) : (
         <div className="hint">
-          The deep agent reads this raw {fields.length}-dimensional vector directly — no discretization.
-          Q(s,·) on the right comes from a neural-network forward pass.
+          The deep agent reads this raw {obsDim}-dimensional vector directly — no discretization. The
+          decision breakdown on the right comes from a neural-network forward pass.
         </div>
       )}
     </div>
