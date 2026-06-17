@@ -46,6 +46,7 @@ npm run test      # unit tests (Vitest)
 
 | Environment | State | Actions | Notes |
 |---|---|---|---|
+| Multi-Armed Bandit | single state | 5 arms | hidden Gaussian arm rewards; the classic explore-vs-exploit testbed; editable noise |
 | GridWorld 5x5 | discrete | 4 | walls, traps, goal; editable rewards |
 | FrozenLake 4x4 | discrete | 4 | deterministic or slippery (stochastic) |
 | CartPole | continuous (x, ẋ, θ, θ̇) | 2 | balance the pole; physics from Gymnasium |
@@ -55,6 +56,8 @@ npm run test      # unit tests (Vitest)
 | Pendulum | continuous (3D) | **continuous** torque | swing up and balance; PPO Gaussian policy |
 
 Continuous environments run real physics internally. For the **tabular** algorithms they are **discretized** (state aggregation) into a finite index, so the same agents work on them unchanged. The **deep-RL** algorithms (DQN, PPO) instead read the **raw continuous vector** directly — no discretization.
+
+The **Multi-Armed Bandit** sits at the opposite extreme — a single-state MDP. Each pull is an independent terminal step, so a tabular agent's `Q(s, a)` is simply a running estimate of each arm's mean reward (it converges to the hidden true mean). This is exploration vs. exploitation in its purest form, with no state transitions to reason about — the natural place to start.
 
 ## Physics & fidelity
 
