@@ -1,16 +1,15 @@
 import { useStore } from '../../state/store';
-import { ALGO_REGISTRY, algoSupportsEnv } from '../../algos/registry';
-import { getEnvEntry } from '../../envs/registry';
+import { ALGO_REGISTRY } from '../../algos/registry';
 
 export function AlgoSelector() {
   const algoId = useStore((s) => s.algoId);
-  const envId = useStore((s) => s.envId);
   const setAlgo = useStore((s) => s.setAlgo);
-  // Only show algorithms compatible with the current environment (e.g. continuous-action
-  // Pendulum → PPO only; discrete-state grids → tabular only).
-  const env = getEnvEntry(envId);
-  const tabular = ALGO_REGISTRY.filter((a) => !a.deep && algoSupportsEnv(a, env));
-  const deep = ALGO_REGISTRY.filter((a) => a.deep && algoSupportsEnv(a, env));
+  // Show ALL algorithms (tabular + deep), always. Picking one that needs a different observation
+  // or action kind than the current environment makes the store switch to a compatible env
+  // (setAlgo -> compatibleEnvId), so you can always cross between the tabular and deep-RL worlds.
+  // (The env dropdown stays filtered by the current algo, which keeps it free of duplicates.)
+  const tabular = ALGO_REGISTRY.filter((a) => !a.deep);
+  const deep = ALGO_REGISTRY.filter((a) => a.deep);
   return (
     <div className="control">
       <label>Algorithm</label>
