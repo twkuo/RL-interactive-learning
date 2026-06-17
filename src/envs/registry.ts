@@ -2,6 +2,7 @@
 import type { AnyEnv } from '../core/types';
 import { GridWorld, type GridWorldConfig } from './discrete/GridWorld';
 import { makeFrozenLake } from './discrete/FrozenLake';
+import { Bandit, type BanditConfig } from './discrete/Bandit';
 import { CartPole } from './continuous/CartPole';
 import { CartPoleVec } from './continuous/CartPoleVec';
 import { Acrobot } from './continuous/Acrobot';
@@ -9,7 +10,7 @@ import { Pendulum } from './continuous/Pendulum';
 import { LunarLander } from './continuous/LunarLander';
 import { MountainCar } from './continuous/MountainCar';
 
-export type RenderKind = 'grid' | 'cartpole' | 'mountaincar' | 'acrobot' | 'pendulum' | 'lunarlander';
+export type RenderKind = 'grid' | 'cartpole' | 'mountaincar' | 'acrobot' | 'pendulum' | 'lunarlander' | 'bandit';
 
 // Default 5x5 GridWorld (deterministic, making it easy to observe argmax -> movement).
 //   . . . . .
@@ -31,6 +32,16 @@ const GRIDWORLD_CFG: GridWorldConfig = {
   holeReward: -1,
   slip: 0,
   maxSteps: 100,
+};
+
+// Multi-armed bandit: a single state, 5 arms with hidden Gaussian rewards. The classic
+// exploration-vs-exploitation testbed (Chapter 3 starts here).
+const BANDIT_CFG: BanditConfig = {
+  id: 'bandit',
+  name: 'Multi-Armed Bandit',
+  arms: 5,
+  noiseStd: 1,
+  maxSteps: 1, // each pull is its own terminal step (no bootstrapping); see Bandit.stepSync
 };
 
 export interface EnvEntry {
@@ -75,6 +86,15 @@ export const ENV_REGISTRY: EnvEntry[] = [
     actionKind: 'discrete',
     compareGroup: 'frozenlake-slippery',
     create: (seed) => makeFrozenLake(true, seed),
+  },
+  {
+    id: 'bandit',
+    name: 'Multi-Armed Bandit',
+    renderKind: 'bandit',
+    obsKind: 'discrete',
+    actionKind: 'discrete',
+    compareGroup: 'bandit',
+    create: (seed) => new Bandit(BANDIT_CFG, seed),
   },
   {
     id: 'cartpole',
